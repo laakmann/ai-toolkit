@@ -420,6 +420,12 @@ class TrainConfig:
         self.max_negative_prompts = kwargs.get('max_negative_prompts', 1)
         # multiplier applied to loos on regularization images
         self.reg_weight = kwargs.get('reg_weight', 1.0)
+        self.reg_consistency_loss = kwargs.get("reg_consistency_loss", False)
+        self.reg_consistency_multiplier = kwargs.get("reg_consistency_multiplier", 0.25)
+        self.reg_consistency_mode = kwargs.get("reg_consistency_mode", "replace")  # replace | add
+        self.reg_consistency_loss_type = kwargs.get("reg_consistency_loss_type", "mse")
+        self.reg_consistency_tolerance = kwargs.get("reg_consistency_tolerance", 0.0)
+        self.reg_consistency_smooth_l1_beta = kwargs.get("reg_consistency_smooth_l1_beta", 0.01)
         self.num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
         # automatically adapte the vae scaling based on the image norm
         self.adaptive_scaling_factor = kwargs.get('adaptive_scaling_factor', False)
@@ -1001,6 +1007,11 @@ class DatasetConfig:
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
+        self.reg_consistency_multiplier = kwargs.get("reg_consistency_multiplier", None)
+        self.reg_consistency_mode = kwargs.get("reg_consistency_mode", None)
+        self.reg_consistency_loss_type = kwargs.get("reg_consistency_loss_type", None)
+        self.reg_consistency_tolerance = kwargs.get("reg_consistency_tolerance", None)
+        self.reg_consistency_smooth_l1_beta = kwargs.get("reg_consistency_smooth_l1_beta", None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)
