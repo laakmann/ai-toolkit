@@ -420,6 +420,8 @@ class TrainConfig:
         self.max_negative_prompts = kwargs.get('max_negative_prompts', 1)
         # multiplier applied to loos on regularization images
         self.reg_weight = kwargs.get('reg_weight', 1.0)
+        self.log_loss_by_dataset = kwargs.get("log_loss_by_dataset", False)
+        self.log_loss_by_dataset_raw = kwargs.get("log_loss_by_dataset_raw", False)
         self.num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
         # automatically adapte the vae scaling based on the image norm
         self.adaptive_scaling_factor = kwargs.get('adaptive_scaling_factor', False)
@@ -885,6 +887,7 @@ class DatasetConfig:
 
     def __init__(self, **kwargs):
         self.type = kwargs.get('type', 'image')  # sd, slider, reference
+        self.name = kwargs.get("name", None)
         # will be legacy
         self.folder_path: str = kwargs.get('folder_path', None)
         # can be json or folder path
