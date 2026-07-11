@@ -1016,6 +1016,9 @@ class DatasetConfig:
             self.caption_ext = legacy_caption_type
         self.caption_type = self.caption_ext
         self.guidance_type: GuidanceType = kwargs.get('guidance_type', 'targeted')
+        self.timestep_type = kwargs.get("timestep_type", None)
+        self.min_denoising_steps = kwargs.get("min_denoising_steps", None)
+        self.max_denoising_steps = kwargs.get("max_denoising_steps", None)
 
         # ip adapter / reference dataset
         self.clip_image_path: str = kwargs.get('clip_image_path', None)  # depth maps, etc
