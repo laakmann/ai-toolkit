@@ -1248,6 +1248,46 @@ class SDTrainer(BaseSDTrainProcess):
         return prior_pred
 
     def _resolve_reg_consistency_settings(self, file_item: FileItemDTO):
+    @staticmethod
+    def _get_safe_dataset_name(dataset_config) -> str:
+        dataset_name = dataset_config.name
+        if dataset_name is None:
+            folder_path = dataset_config.folder_path
+            if folder_path is None:
+                folder_path = dataset_config.dataset_path
+            if folder_path is None:
+                folder_path = "unknown"
+            dataset_name = os.path.basename(str(folder_path).rstrip("/"))
+            if dataset_name == "":
+                dataset_name = "unknown"
+        return dataset_name.replace("/", "_").replace("\\", "_")
+
+    def _log_loss_by_dataset(
+        self,
+        batch: DataLoaderBatchDTO,
+        effective_loss: torch.Tensor,
+        raw_loss: Optional[torch.Tensor] = None,
+    ):
+        if not self.train_config.log_loss_by_dataset:
+            return
+
+        has_raw_loss = (
+            self.train_config.log_loss_by_dataset_raw
+            and raw_loss is not None
+            and torch.isfinite(raw_loss).all().item()
+        )
+
+        logged_dataset_names = set()
+        for file_item in batch.file_items:
+            safe_name = self._get_safe_dataset_name(file_item.dataset_config)
+            if safe_name in logged_dataset_names:
+                continue
+            logged_dataset_names.add(safe_name)
+            self.additional_logs[f"loss_by_dataset/{safe_name}/effective"] = effective_loss.item()
+            if has_raw_loss:
+                self.additional_logs[f"loss_by_dataset/{safe_name}/raw"] = raw_loss.item()
+
+    def _resolve_reg_consistency_settings(self, file_item: FileItemDTO):
         dataset_config = file_item.dataset_config
         mode = dataset_config.reg_consistency_mode
         if mode is None:
@@ -2181,6 +2221,7 @@ class SDTrainer(BaseSDTrainProcess):
                         )
 
                 # check if nan
+                raw_loss_for_dataset = loss.detach()
                 if torch.isnan(loss):
                     print_acc("loss is nan")
                     loss = torch.zeros_like(loss).requires_grad_(True)
@@ -2188,6 +2229,11 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('backward'):
                     # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
                     loss = loss * loss_multiplier.mean()
+                    self._log_loss_by_dataset(
+                        batch=batch,
+                        effective_loss=loss.detach(),
+                        raw_loss=raw_loss_for_dataset,
+                    )
                     # IMPORTANT if gradient checkpointing do not leave with network when doing backward
                     # it will destroy the gradients. This is because the network is a context manager
                     # and will change the multipliers back to 0.0 when exiting. They will be
