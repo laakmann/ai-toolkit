@@ -25,7 +25,7 @@ from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
-    apply_learnable_snr_gos, LearnableSNRGamma
+    apply_learnable_snr_gos, LearnableSNRGamma, compute_reg_consistency_loss
 import gc
 import torch
 from jobs.process import BaseSDTrainProcess
@@ -1247,6 +1247,86 @@ class SDTrainer(BaseSDTrainProcess):
                 self.network.is_active = was_network_active
         return prior_pred
 
+    def _resolve_reg_consistency_settings(self, file_item: FileItemDTO):
+        dataset_config = file_item.dataset_config
+        mode = dataset_config.reg_consistency_mode
+        if mode is None:
+            mode = self.train_config.reg_consistency_mode
+        loss_type = dataset_config.reg_consistency_loss_type
+        if loss_type is None:
+            loss_type = self.train_config.reg_consistency_loss_type
+        tolerance = dataset_config.reg_consistency_tolerance
+        if tolerance is None:
+            tolerance = self.train_config.reg_consistency_tolerance
+        smooth_l1_beta = dataset_config.reg_consistency_smooth_l1_beta
+        if smooth_l1_beta is None:
+            smooth_l1_beta = self.train_config.reg_consistency_smooth_l1_beta
+        dataset_reg_consistency_multiplier = dataset_config.reg_consistency_multiplier
+        if dataset_reg_consistency_multiplier is None:
+            dataset_reg_consistency_multiplier = 1.0
+        effective_multiplier = (
+            self.train_config.reg_consistency_multiplier
+            * dataset_reg_consistency_multiplier
+            * dataset_config.loss_multiplier
+        )
+        return mode, loss_type, tolerance, smooth_l1_beta, effective_multiplier
+
+    def _apply_reg_consistency_loss(
+        self,
+        *,
+        loss: torch.Tensor,
+        noise_pred: torch.Tensor,
+        prior_pred: torch.Tensor,
+        batch: DataLoaderBatchDTO,
+    ) -> torch.Tensor:
+        reg_indices = [idx for idx, file_item in enumerate(batch.file_items) if file_item.is_reg]
+        if len(reg_indices) == 0:
+            return loss
+
+        raw_loss_list = []
+        effective_loss_list = []
+        mode_set = set()
+        dataset_effective_loss = {}
+
+        for idx in reg_indices:
+            file_item = batch.file_items[idx]
+            mode, loss_type, tolerance, smooth_l1_beta, effective_multiplier = self._resolve_reg_consistency_settings(file_item)
+            mode_set.add(mode)
+            raw_loss = compute_reg_consistency_loss(
+                noise_pred[idx:idx + 1],
+                prior_pred[idx:idx + 1],
+                loss_type=loss_type,
+                tolerance=tolerance,
+                smooth_l1_beta=smooth_l1_beta,
+            )
+            effective_loss = raw_loss * effective_multiplier
+
+            raw_loss_list.append(raw_loss)
+            effective_loss_list.append(effective_loss)
+
+            dataset_config = file_item.dataset_config
+            dataset_name = getattr(dataset_config, "name", None)
+            if dataset_name is None:
+                dataset_name = dataset_config.dataset_path or dataset_config.folder_path or "unknown"
+            if dataset_name not in dataset_effective_loss:
+                dataset_effective_loss[dataset_name] = []
+            dataset_effective_loss[dataset_name].append(effective_loss)
+
+        raw_loss = torch.stack(raw_loss_list).mean()
+        effective_loss = torch.stack(effective_loss_list).mean()
+
+        self.additional_logs["loss/reg_consistency/raw"] = raw_loss.item()
+        self.additional_logs["loss/reg_consistency/effective"] = effective_loss.item()
+        for dataset_name, dataset_losses in dataset_effective_loss.items():
+            self.additional_logs[f"loss_by_dataset/{dataset_name}/reg_consistency_effective"] = torch.stack(dataset_losses).mean().item()
+
+        mode = "add" if len(mode_set) > 1 else list(mode_set)[0]
+        if mode == "replace":
+            return effective_loss
+        if mode == "add":
+            return loss + effective_loss
+        raise ValueError(f"Unknown reg consistency mode: {mode}")
+
     def before_unet_predict(self):
         pass
 
@@ -1331,8 +1411,9 @@ class SDTrainer(BaseSDTrainProcess):
             has_adapter_img = batch.control_tensor is not None
             has_clip_image = batch.clip_image_tensor is not None
             has_clip_image_embeds = batch.clip_image_embeds is not None
+            has_reg_items = any([batch.file_items[idx].is_reg for idx in range(len(batch.file_items))])
             # force it to be true if doing regs as we handle those differently
-            if any([batch.file_items[idx].is_reg for idx in range(len(batch.file_items))]):
+            if has_reg_items:
                 has_clip_image = True
                 if self._clip_image_embeds_unconditional is not None:
                     has_clip_image_embeds = True  # we are caching embeds, handle that differently
@@ -1342,6 +1423,7 @@ class SDTrainer(BaseSDTrainProcess):
             do_reg_prior = False
             if any([batch.file_items[idx].prior_reg for idx in range(len(batch.file_items))]):
                 do_reg_prior = True
+            do_reg_consistency = self.train_config.reg_consistency_loss and has_reg_items
 
             if self.adapter is not None and isinstance(self.adapter, IPAdapter) and not has_clip_image and has_adapter_img:
                 raise ValueError(
@@ -1861,7 +1943,7 @@ class SDTrainer(BaseSDTrainProcess):
                         do_guidance_prior = True
 
                 if ((
-                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or self.do_prior_prediction or do_guidance_prior or do_reg_prior or do_inverted_masked_prior or self.train_config.correct_pred_norm):
+                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or self.do_prior_prediction or do_guidance_prior or do_reg_prior or do_reg_consistency or do_inverted_masked_prior or self.train_config.correct_pred_norm):
                     with self.timer('prior predict'):
                         prior_embeds_to_use = conditional_embeds
                         # use diff_output_preservation embeds if doing dfe
@@ -2089,6 +2171,14 @@ class SDTrainer(BaseSDTrainProcess):
                         self.additional_logs['loss/normal'] = loss.item()
                         self.additional_logs['loss/preservation'] = preservation_loss.item()
                         loss = loss + preservation_loss
+
+                    if do_reg_consistency and prior_pred is not None:
+                        loss = self._apply_reg_consistency_loss(
+                            loss=loss,
+                            noise_pred=noise_pred,
+                            prior_pred=prior_pred,
+                            batch=batch,
+                        )
 
                 # check if nan
                 if torch.isnan(loss):
