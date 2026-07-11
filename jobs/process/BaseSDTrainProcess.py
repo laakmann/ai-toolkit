@@ -1153,15 +1153,52 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with self.timer('prepare_scheduler'):
                 
                 batch_size = len(batch.file_items)
+                timestep_dataset_cfg = batch.file_items[0].dataset_config
+                all_items_share_dataset_config = all([
+                    file_item.dataset_config is timestep_dataset_cfg for file_item in batch.file_items
+                ])
+                any_dataset_timestep_override = any([
+                    file_item.dataset_config.timestep_type is not None
+                    or file_item.dataset_config.min_denoising_steps is not None
+                    or file_item.dataset_config.max_denoising_steps is not None
+                    for file_item in batch.file_items
+                ])
+                if any_dataset_timestep_override and not (batch_size == 1 or all_items_share_dataset_config):
+                    raise ValueError(
+                        "Dataset-level timestep overrides currently require batch_size == 1 or all batch items from the same dataset config"
+                    )
+
+                effective_timestep_type = self.train_config.timestep_type
                 min_noise_steps = self.train_config.min_denoising_steps
                 max_noise_steps = self.train_config.max_denoising_steps
+                dataset_override_active = False
+                if batch_size == 1 or all_items_share_dataset_config:
+                    if timestep_dataset_cfg.timestep_type is not None:
+                        effective_timestep_type = timestep_dataset_cfg.timestep_type
+                        dataset_override_active = True
+                    if timestep_dataset_cfg.min_denoising_steps is not None:
+                        min_noise_steps = timestep_dataset_cfg.min_denoising_steps
+                        dataset_override_active = True
+                    if timestep_dataset_cfg.max_denoising_steps is not None:
+                        max_noise_steps = timestep_dataset_cfg.max_denoising_steps
+                        dataset_override_active = True
+
+                batch.effective_timestep_type = effective_timestep_type
+
+                if dataset_override_active and self.logging_config.verbose:
+                    dataset_name = timestep_dataset_cfg.folder_path or timestep_dataset_cfg.dataset_path or "unknown"
+                    dataset_name = os.path.basename(str(dataset_name).rstrip("/")) or "unknown"
+                    print_acc(
+                        f"Dataset timestep override active: dataset={dataset_name}, timestep_type={effective_timestep_type}, min={min_noise_steps}, max={max_noise_steps}"
+                    )
+
                 if self.model_config.refiner_name_or_path is not None:
                     # if we are not training the unet, then we are only doing refiner and do not need to double up
                     if self.train_config.train_unet:
-                        max_noise_steps = round(self.train_config.max_denoising_steps * self.model_config.refiner_start_at)
+                        max_noise_steps = round(max_noise_steps * self.model_config.refiner_start_at)
                         do_double = True
                     else:
-                        min_noise_steps = round(self.train_config.max_denoising_steps * self.model_config.refiner_start_at)
+                        min_noise_steps = round(max_noise_steps * self.model_config.refiner_start_at)
                         do_double = False
 
                 num_train_timesteps = self.train_config.num_train_timesteps
@@ -1179,15 +1216,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     linear_timesteps = any([
                         self.train_config.linear_timesteps,
                         self.train_config.linear_timesteps2,
-                        self.train_config.timestep_type == 'linear',
-                        self.train_config.timestep_type in ['one_step', 'two_step', 'four_step', 'eight_step'],
+                        effective_timestep_type == 'linear',
+                        effective_timestep_type in ['one_step', 'two_step', 'four_step', 'eight_step'],
                     ])
                     
                     timestep_type = 'linear' if linear_timesteps else None
                     if timestep_type is None:
-                        timestep_type = self.train_config.timestep_type
+                        timestep_type = effective_timestep_type
                     
-                    if self.train_config.timestep_type == 'next_sample':
+                    if effective_timestep_type == 'next_sample':
                         # simulate a sample
                         num_train_timesteps = self.train_config.next_sample_timesteps
                         timestep_type = 'shift'
@@ -1234,16 +1271,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
-                if self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
-                    if self.train_config.timestep_type == 'two_step':
+                if effective_timestep_type in ['two_step', 'four_step', 'eight_step']:
+                    if effective_timestep_type == 'two_step':
                         indice_choices = [0, 499]
-                    elif self.train_config.timestep_type == 'four_step':
+                    elif effective_timestep_type == 'four_step':
                         indice_choices = [0, 250, 500, 750]
-                    elif self.train_config.timestep_type == 'eight_step':
+                    elif effective_timestep_type == 'eight_step':
                         indice_choices = [0, 125, 250, 375, 500, 625, 750, 875]
                     timestep_indices = torch.tensor(random.choices(indice_choices, k=batch_size), device=self.device_torch)
                     timestep_indices = timestep_indices.long()
-                elif self.train_config.timestep_type == 'next_sample':
+                elif effective_timestep_type == 'next_sample':
                     timestep_indices = torch.randint(
                             0,
                             num_train_timesteps - 2, # -1 for 0 idx, -1 so we can step
@@ -1251,7 +1288,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             device=self.device_torch
                         )
                     timestep_indices = timestep_indices.long()
-                elif self.train_config.timestep_type == 'one_step':
+                elif effective_timestep_type == 'one_step':
                     timestep_indices = torch.zeros((batch_size,), device=self.device_torch, dtype=torch.long)
                 elif content_or_style in ['style', 'content']:
                     # this is from diffusers training code
