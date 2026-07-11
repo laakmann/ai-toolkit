@@ -11,12 +11,13 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader, ConcatDataset
 
 from toolkit import train_tools
+from toolkit.bad_state_guard import BadStatePool
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
-from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
+from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType, targeted_flow_guidance
 from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
@@ -83,6 +84,7 @@ class SDTrainer(BaseSDTrainProcess):
         
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
+        self.bad_state_pool: Optional[BadStatePool] = None
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -1247,7 +1249,6 @@ class SDTrainer(BaseSDTrainProcess):
                 self.network.is_active = was_network_active
         return prior_pred
 
-    def _resolve_reg_consistency_settings(self, file_item: FileItemDTO):
     @staticmethod
     def _get_safe_dataset_name(dataset_config) -> str:
         dataset_name = dataset_config.name
@@ -1366,6 +1367,72 @@ class SDTrainer(BaseSDTrainProcess):
         if mode == "add":
             return loss + effective_loss
         raise ValueError(f"Unknown reg consistency mode: {mode}")
+
+    def _get_bad_state_pool(self) -> BadStatePool:
+        if self.bad_state_pool is None:
+            cfg = self.train_config.bad_state_guard
+            self.bad_state_pool = BadStatePool(
+                path=cfg.path,
+                sd=self.sd,
+                cache_latents=cfg.cache_latents,
+                match_strategy=cfg.match_strategy,
+                resize_mode=cfg.resize_mode,
+            )
+        return self.bad_state_pool
+
+    def _maybe_apply_bad_state_guard_loss(
+        self,
+        *,
+        loss: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        conditional_embeds: PromptEmbeds,
+        match_adapter_assist: bool,
+        network_weight_list: list,
+        timesteps: torch.Tensor,
+        pred_kwargs: dict,
+        batch: DataLoaderBatchDTO,
+        noise: torch.Tensor,
+        unconditional_embeds: Optional[PromptEmbeds],
+        is_reg: bool,
+    ) -> torch.Tensor:
+        cfg = self.train_config.bad_state_guard
+        if not cfg.enabled:
+            return loss
+        if not self.sd.is_flow_matching:
+            raise ValueError("bad_state_guard currently requires a flow-matching model")
+        if cfg.loss_type != "targeted_flow":
+            raise ValueError(f"Unsupported bad_state_guard.loss_type: {cfg.loss_type}")
+        if is_reg and not cfg.apply_to_reg:
+            return loss
+        if random.random() >= cfg.probability:
+            return loss
+
+        bad_state_pool = self._get_bad_state_pool()
+        bad_latents = bad_state_pool.get_latents_like(batch.latents, batch)
+        original_unconditional_latents = batch.unconditional_latents
+        batch.unconditional_latents = bad_latents
+        try:
+            guard_loss = targeted_flow_guidance(
+                noisy_latents=noisy_latents,
+                conditional_embeds=conditional_embeds,
+                match_adapter_assist=match_adapter_assist,
+                network_weight_list=network_weight_list,
+                timesteps=timesteps,
+                pred_kwargs=pred_kwargs,
+                batch=batch,
+                noise=noise,
+                sd=self.sd,
+                unconditional_embeds=unconditional_embeds,
+                train_config=self.train_config,
+            )
+        finally:
+            batch.unconditional_latents = original_unconditional_latents
+
+        effective_guard_loss = guard_loss * cfg.multiplier
+        self.additional_logs["loss/bad_state_guard/raw"] = guard_loss.item()
+        self.additional_logs["loss/bad_state_guard/effective"] = effective_guard_loss.item()
+        self.additional_logs["bad_state_guard/applied"] = 1.0
+        return loss + effective_guard_loss
 
     def before_unet_predict(self):
         pass
@@ -2219,6 +2286,20 @@ class SDTrainer(BaseSDTrainProcess):
                             prior_pred=prior_pred,
                             batch=batch,
                         )
+
+                loss = self._maybe_apply_bad_state_guard_loss(
+                    loss=loss,
+                    noisy_latents=noisy_latents,
+                    conditional_embeds=conditional_embeds,
+                    match_adapter_assist=match_adapter_assist,
+                    network_weight_list=network_weight_list,
+                    timesteps=timesteps,
+                    pred_kwargs=pred_kwargs,
+                    batch=batch,
+                    noise=noise,
+                    unconditional_embeds=unconditional_embeds,
+                    is_reg=is_reg,
+                )
 
                 # check if nan
                 raw_loss_for_dataset = loss.detach()
