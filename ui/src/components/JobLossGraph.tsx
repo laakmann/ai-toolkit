@@ -517,7 +517,7 @@ export default function JobLossGraph({ job }: Props) {
           if (c) return [c.min, c.max];
           if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) return [0, 1];
           if (dataMin === dataMax) {
-            if (useSeriesLogScale) {
+            if (useLogScale) {
               const v = dataMin > 0 ? dataMin : 1e-6;
               return [Math.max(v * 0.9, 1e-6), Math.max(v * 1.1, 1e-5)];
             }
@@ -531,7 +531,7 @@ export default function JobLossGraph({ job }: Props) {
         scale: scaleKey,
         side: ki % 2 === 0 ? 3 : 1, // alternate left / right
         stroke: color,
-        label: useLogScale && !useSeriesLogScale ? `${keyLabel} (lin)` : keyLabel,
+        label: keyLabel,
         labelSize: 14,
         // Only the first scale draws gridlines; overlaying grids from multiple
         // independent scales would be unreadable.
