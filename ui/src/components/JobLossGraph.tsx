@@ -287,14 +287,24 @@ export default function JobLossGraph({ job }: Props) {
       const key = activeKeys[ki];
       const scaleKey = `y::${key}`;
       const pts: LossPoint[] = series[key] ?? [];
-      const map = new Map<number, number>();
+      const mapAll = new Map<number, number>();
+      const mapLog = new Map<number, number>();
+      let positiveCount = 0;
       for (const p of pts) {
         if (p.value === null || !Number.isFinite(p.value as number)) continue;
-        if (useLogScale && (p.value as number) <= 0) continue;
         if (!xsSet.has(p.step)) continue;
-        map.set(p.step, p.value as number);
+        const value = p.value as number;
+        mapAll.set(p.step, value);
+        if (value > 0) {
+          mapLog.set(p.step, value);
+          positiveCount += 1;
+        }
       }
+      const useSeriesLogScale = useLogScale && positiveCount >= 2;
+      const map = useSeriesLogScale ? mapLog : mapAll;
       const raw: (number | null)[] = xs.map(s => (map.has(s) ? (map.get(s) as number) : null));
+      const visiblePointCount = raw.reduce((n, v) => (v === null || !Number.isFinite(v) ? n : n + 1), 0);
+      const showPoints = visiblePointCount > 0 && visiblePointCount <= 2;
       const smooth = emaWithNulls(raw, alpha);
       const fullSmooth = emaWithNulls(raw, fullAlpha);
 
@@ -311,12 +321,12 @@ export default function JobLossGraph({ job }: Props) {
         stroke: color,
         width: 2,
         spanGaps: false,
-        points: { show: false },
+        points: showPoints ? { show: true, size: 6 } : { show: false },
         value: (_u, value) => formatNum(value),
       });
       colArrays.push(smooth);
 
-      if (showTrend) {
+      if (showTrend && visiblePointCount >= 3) {
         data.push(fullSmooth);
         seriesConfigs.push({
           label: `${key} (trend)`,
@@ -333,7 +343,7 @@ export default function JobLossGraph({ job }: Props) {
       scaleArrays[scaleKey] = colArrays;
 
       scales[scaleKey] = {
-        distr: useLogScale ? 3 : 1,
+        distr: useSeriesLogScale ? 3 : 1,
         range: (_u, dataMin, dataMax) => {
           const c = yClipRef.current?.[scaleKey];
           if (c) return [c.min, c.max];
@@ -345,7 +355,7 @@ export default function JobLossGraph({ job }: Props) {
         scale: scaleKey,
         side: ki % 2 === 0 ? 3 : 1, // alternate left / right
         stroke: color,
-        label: key,
+        label: useLogScale && !useSeriesLogScale ? `${key} (lin)` : key,
         labelSize: 14,
         // Only the first scale draws gridlines; overlaying grids from multiple
         // independent scales would be unreadable.
