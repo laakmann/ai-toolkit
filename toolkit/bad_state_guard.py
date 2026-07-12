@@ -36,10 +36,34 @@ class BadStatePool:
         self.cache_latents = cache_latents
         self.match_strategy = match_strategy
         self.resize_mode = resize_mode
-        self.vae_scale_factor = 2 ** (len(self.sd.vae.config["block_out_channels"]) - 1)
+        self.vae_scale_factor = self._resolve_vae_scale_factor()
         self.image_paths = self._get_image_paths(path)
         self.aspect_ratio_by_path: Dict[str, float] = self._build_aspect_ratio_map(self.image_paths)
         self.latent_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
+
+    def _resolve_vae_scale_factor(self) -> int:
+        vae = getattr(self.sd, "vae", None)
+        config = getattr(vae, "config", None)
+
+        if config is not None:
+            try:
+                block_out_channels = config["block_out_channels"]
+                return 2 ** (len(block_out_channels) - 1)
+            except Exception:
+                block_out_channels = getattr(config, "block_out_channels", None)
+                if block_out_channels is not None:
+                    return 2 ** (len(block_out_channels) - 1)
+
+        scale = getattr(self.sd, "vae_scale_factor", None)
+        if isinstance(scale, int) and scale > 0:
+            return scale
+
+        pipeline = getattr(self.sd, "pipeline", None)
+        pipeline_scale = getattr(pipeline, "vae_scale_factor", None)
+        if isinstance(pipeline_scale, int) and pipeline_scale > 0:
+            return pipeline_scale
+
+        return 8
 
     @staticmethod
     def _get_image_paths(path: str) -> List[str]:
