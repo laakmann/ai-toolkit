@@ -83,6 +83,7 @@ class SDTrainer(BaseSDTrainProcess):
         
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
+        self._dataset_sequence_by_id = {id(dataset): idx + 1 for idx, dataset in enumerate(self.dataset_configs)}
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -1248,7 +1249,32 @@ class SDTrainer(BaseSDTrainProcess):
         return prior_pred
 
     @staticmethod
-    def _get_safe_dataset_name(dataset_config) -> str:
+    def _sanitize_metric_token(value: str, max_len: int = 28) -> str:
+        text = str(value).strip()
+        if text == "":
+            return "unknown"
+
+        cleaned_chars = []
+        for ch in text:
+            if ch.isalnum() or ch in ["-", "_"]:
+                cleaned_chars.append(ch)
+            else:
+                cleaned_chars.append("-")
+
+        cleaned = "".join(cleaned_chars)
+        while "--" in cleaned:
+            cleaned = cleaned.replace("--", "-")
+        cleaned = cleaned.strip("-_")
+        if cleaned == "":
+            cleaned = "unknown"
+        if len(cleaned) > max_len:
+            cleaned = cleaned[:max_len].rstrip("-_")
+        return cleaned or "unknown"
+
+    def _dataset_sequence(self, dataset_config) -> int:
+        return self._dataset_sequence_by_id.get(id(dataset_config), 0)
+
+    def _dataset_label(self, dataset_config) -> str:
         dataset_name = dataset_config.name
         if dataset_name is None:
             folder_path = dataset_config.folder_path
@@ -1259,7 +1285,46 @@ class SDTrainer(BaseSDTrainProcess):
             dataset_name = os.path.basename(str(folder_path).rstrip("/"))
             if dataset_name == "":
                 dataset_name = "unknown"
-        return dataset_name.replace("/", "_").replace("\\", "_")
+        return self._sanitize_metric_token(dataset_name, max_len=20)
+
+    @staticmethod
+    def _dataset_root(dataset_config) -> Optional[str]:
+        root = dataset_config.dataset_path or dataset_config.folder_path
+        if root is None:
+            return None
+        root = str(root)
+        if os.path.isfile(root):
+            root = os.path.dirname(root)
+        return os.path.abspath(root)
+
+    def _dataset_metric_prefix(self, dataset_config) -> str:
+        seq = self._dataset_sequence(dataset_config)
+        return f"d{seq}/{self._dataset_label(dataset_config)}"
+
+    def _dataset_subdir_label(self, file_item: FileItemDTO) -> str:
+        file_dir = os.path.dirname(str(file_item.path))
+        if file_dir == "":
+            return "root"
+
+        dataset_root = self._dataset_root(file_item.dataset_config)
+        if dataset_root is not None:
+            file_dir_abs = os.path.abspath(file_dir)
+            try:
+                if os.path.commonpath([dataset_root, file_dir_abs]) == dataset_root:
+                    rel = os.path.relpath(file_dir_abs, dataset_root)
+                    if rel in [".", ""]:
+                        return "root"
+                    return self._sanitize_metric_token(os.path.basename(rel), max_len=24)
+            except ValueError:
+                pass
+
+        return self._sanitize_metric_token(os.path.basename(file_dir), max_len=24)
+
+    def _dataset_metric_key(self, file_item: FileItemDTO, include_subdir: bool) -> str:
+        prefix = self._dataset_metric_prefix(file_item.dataset_config)
+        if not include_subdir:
+            return prefix
+        return f"{prefix}/{self._dataset_subdir_label(file_item)}"
 
     def _log_loss_by_dataset(
         self,
@@ -1276,15 +1341,15 @@ class SDTrainer(BaseSDTrainProcess):
             and torch.isfinite(raw_loss).all().item()
         )
 
-        logged_dataset_names = set()
+        logged_dataset_keys = set()
         for file_item in batch.file_items:
-            safe_name = self._get_safe_dataset_name(file_item.dataset_config)
-            if safe_name in logged_dataset_names:
+            dataset_key = self._dataset_metric_key(file_item, include_subdir=True)
+            if dataset_key in logged_dataset_keys:
                 continue
-            logged_dataset_names.add(safe_name)
-            self.additional_logs[f"loss_by_dataset/{safe_name}/effective"] = effective_loss.item()
+            logged_dataset_keys.add(dataset_key)
+            self.additional_logs[f"loss_by_dataset/{dataset_key}/effective"] = effective_loss.item()
             if has_raw_loss:
-                self.additional_logs[f"loss_by_dataset/{safe_name}/raw"] = raw_loss.item()
+                self.additional_logs[f"loss_by_dataset/{dataset_key}/raw"] = raw_loss.item()
 
     def before_unet_predict(self):
         pass
