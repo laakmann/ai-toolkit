@@ -618,6 +618,7 @@ export default function JobLossGraph({ job }: Props) {
               onChange={e => setMaWindow(Number(e.target.value))}
               className="w-full accent-blue-500"
             />
+            <div className="mt-2 text-[11px] text-gray-500">Central tendency uses trailing MA (causal).</div>
           </div>
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
