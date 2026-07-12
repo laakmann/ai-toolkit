@@ -423,7 +423,7 @@ export default function JobLossGraph({ job }: Props) {
             scale: scaleKey,
             stroke: colorDull,
             width: 2,
-            spanGaps,
+            spanGaps: true,
             points: { show: false },
             value: (_u, value) => formatNum(value),
           });
