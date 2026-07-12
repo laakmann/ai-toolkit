@@ -382,7 +382,7 @@ export default function JobLossGraph({ job }: Props) {
           scale: scaleKey,
           stroke: color,
           width: 2,
-          spanGaps,
+          spanGaps: true,
           points: showSparsePoints ? { show: true, size: 6 } : { show: false },
           value: (_u, value) => formatNum(value),
         });
@@ -395,7 +395,7 @@ export default function JobLossGraph({ job }: Props) {
             scale: scaleKey,
             stroke: colorDull,
             width: 2.5,
-            spanGaps: false,
+            spanGaps: true,
             points: { show: false },
             value: (_u, value) => formatNum(value),
           });
