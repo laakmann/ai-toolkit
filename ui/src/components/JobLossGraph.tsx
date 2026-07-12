@@ -141,6 +141,7 @@ function strokeForKey(key: string) {
 interface PersistedSettings {
   smoothingMode: 'ema' | 'ma';
   useLogScale: boolean;
+  showRawSeries: boolean;
   showTrend: boolean;
   emaSmoothing: number;
   showMovingAverage: boolean;
@@ -172,6 +173,7 @@ export default function JobLossGraph({ job }: Props) {
   // Controls
   const [smoothingMode, setSmoothingMode] = useState<'ema' | 'ma'>('ema');
   const [useLogScale, setUseLogScale] = useState(false);
+  const [showRawSeries, setShowRawSeries] = useState(false);
   const [showTrend, setShowTrend] = useState(true);
   const [emaSmoothing, setEmaSmoothing] = useState(80);
   const [showMovingAverage, setShowMovingAverage] = useState(true);
@@ -226,6 +228,7 @@ export default function JobLossGraph({ job }: Props) {
           setSmoothingMode('ma');
         }
         if (typeof s.useLogScale === 'boolean') setUseLogScale(s.useLogScale);
+        if (typeof s.showRawSeries === 'boolean') setShowRawSeries(s.showRawSeries);
         if (typeof s.showTrend === 'boolean') setShowTrend(s.showTrend);
         if (typeof s.emaSmoothing === 'number') setEmaSmoothing(s.emaSmoothing);
         else if (typeof s.smoothing === 'number') setEmaSmoothing(s.smoothing);
@@ -258,6 +261,7 @@ export default function JobLossGraph({ job }: Props) {
       const payload: PersistedSettings = {
         smoothingMode,
         useLogScale,
+        showRawSeries,
         showTrend,
         emaSmoothing,
         showMovingAverage,
@@ -275,6 +279,7 @@ export default function JobLossGraph({ job }: Props) {
     hydrated,
     smoothingMode,
     useLogScale,
+    showRawSeries,
     showTrend,
     emaSmoothing,
     showMovingAverage,
@@ -284,6 +289,11 @@ export default function JobLossGraph({ job }: Props) {
     clipOutliers,
     enabled,
   ]);
+
+  const visibleLossKeys = useMemo(() => {
+    if (showRawSeries) return lossKeys;
+    return lossKeys.filter(k => !k.endsWith('/raw'));
+  }, [lossKeys, showRawSeries]);
 
   // keep enabled map in sync with discovered keys. Only "loss/loss" is on by
   // default; every other metric starts deactivated (user can toggle it on).
@@ -303,7 +313,7 @@ export default function JobLossGraph({ job }: Props) {
     });
   }, [lossKeys]);
 
-  const activeKeys = useMemo(() => lossKeys.filter(k => enabled[k] !== false), [lossKeys, enabled]);
+  const activeKeys = useMemo(() => visibleLossKeys.filter(k => enabled[k] !== false), [visibleLossKeys, enabled]);
 
   // Build uPlot-aligned data + series configs.
   const built = useMemo(() => {
@@ -712,6 +722,7 @@ export default function JobLossGraph({ job }: Props) {
                   />
                 </>
               )}
+              <ToggleButton checked={showRawSeries} onClick={() => setShowRawSeries(v => !v)} label="Show raw series" />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
               <ToggleButton checked={clipOutliers} onClick={() => setClipOutliers(v => !v)} label="Clip outliers" />
             </div>
@@ -719,11 +730,11 @@ export default function JobLossGraph({ job }: Props) {
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
             <label className="block text-xs text-gray-400 mb-2">Series</label>
-            {lossKeys.length === 0 ? (
+            {visibleLossKeys.length === 0 ? (
               <div className="text-sm text-gray-400">No loss keys found yet.</div>
             ) : (
               <div className="flex flex-wrap gap-2">
-                {lossKeys.map(k => (
+                {visibleLossKeys.map(k => (
                   <button
                     key={k}
                     type="button"
