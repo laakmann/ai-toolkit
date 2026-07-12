@@ -2350,6 +2350,7 @@ class SDTrainer(BaseSDTrainProcess):
                             batch=batch,
                         )
 
+                loss_before_bad_state_guard = loss.detach()
                 loss = self._maybe_apply_bad_state_guard_loss(
                     loss=loss,
                     noisy_latents=noisy_latents,
@@ -2365,7 +2366,7 @@ class SDTrainer(BaseSDTrainProcess):
                 )
 
                 # check if nan
-                raw_loss_for_dataset = loss.detach()
+                raw_loss_for_dataset = loss_before_bad_state_guard
                 if torch.isnan(loss):
                     print_acc("loss is nan")
                     loss = torch.zeros_like(loss).requires_grad_(True)
