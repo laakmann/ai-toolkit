@@ -256,7 +256,6 @@ export default function JobLossGraph({ job }: Props) {
       const pts: LossPoint[] = series[key] ?? [];
       for (const p of pts) {
         if (p.value === null || !Number.isFinite(p.value as number)) continue;
-        if (useLogScale && (p.value as number) <= 0) continue;
         stepSet.add(p.step);
       }
     }
