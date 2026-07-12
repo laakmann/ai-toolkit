@@ -142,6 +142,7 @@ interface PersistedSettings {
   smoothingMode: 'ema' | 'ma';
   useLogScale: boolean;
   showRawSeries: boolean;
+  showAuxSeries: boolean;
   showTrend: boolean;
   emaSmoothing: number;
   showMovingAverage: boolean;
@@ -167,6 +168,55 @@ function dulledColor(rgba: string): string {
   return `rgba(${r},${g},${b},1)`;
 }
 
+function hasFinitePoints(points: LossPoint[] | undefined): boolean {
+  if (!points || points.length === 0) return false;
+  for (const p of points) {
+    if (p.value !== null && Number.isFinite(p.value as number)) return true;
+  }
+  return false;
+}
+
+function isAuxiliarySeriesKey(key: string): boolean {
+  return key === 'bad_state_guard/applied'
+    || key.includes('/reg_consistency_effective')
+    || key.startsWith('loss/reg_consistency/')
+    || key.startsWith('loss/bad_state_guard/');
+}
+
+function formatLossKeyLabel(key: string): string {
+  if (key === 'loss/loss') return 'loss';
+
+  if (key.startsWith('loss_by_dataset/')) {
+    const rest = key.slice('loss_by_dataset/'.length);
+    const parts = rest.split('/').filter(Boolean);
+    if (parts.length < 2) return rest;
+
+    const datasetSeq = parts[0];
+    const metric = parts[parts.length - 1];
+    const pathParts = parts.slice(1, -1);
+    const subdir = pathParts.length > 1 ? pathParts.slice(1).join('/') : null;
+
+    let suffix = metric;
+    if (metric === 'effective') suffix = 'loss';
+    else if (metric === 'raw') suffix = 'loss_raw';
+    else if (metric === 'reg_consistency_effective') suffix = 'reg_consistency_loss';
+
+    if (subdir && subdir !== 'root') return `${datasetSeq}/${subdir}/${suffix}`;
+    if (subdir === 'root') return `${datasetSeq}/root/${suffix}`;
+    if (suffix === 'reg_consistency_loss') return `${datasetSeq}/${suffix}`;
+    return `${datasetSeq}/root/${suffix}`;
+  }
+
+  if (key.startsWith('loss/')) {
+    const rest = key.slice('loss/'.length);
+    if (rest.endsWith('/effective')) return `${rest.slice(0, -'/effective'.length)}/loss`;
+    if (rest.endsWith('/raw')) return `${rest.slice(0, -'/raw'.length)}/loss_raw`;
+    return rest;
+  }
+
+  return key;
+}
+
 export default function JobLossGraph({ job }: Props) {
   const { series, lossKeys, status, refreshLoss } = useJobLossLog(job.id, 2000);
 
@@ -174,6 +224,7 @@ export default function JobLossGraph({ job }: Props) {
   const [smoothingMode, setSmoothingMode] = useState<'ema' | 'ma'>('ema');
   const [useLogScale, setUseLogScale] = useState(false);
   const [showRawSeries, setShowRawSeries] = useState(false);
+  const [showAuxSeries, setShowAuxSeries] = useState(false);
   const [showTrend, setShowTrend] = useState(true);
   const [emaSmoothing, setEmaSmoothing] = useState(80);
   const [showMovingAverage, setShowMovingAverage] = useState(true);
@@ -229,6 +280,7 @@ export default function JobLossGraph({ job }: Props) {
         }
         if (typeof s.useLogScale === 'boolean') setUseLogScale(s.useLogScale);
         if (typeof s.showRawSeries === 'boolean') setShowRawSeries(s.showRawSeries);
+        if (typeof s.showAuxSeries === 'boolean') setShowAuxSeries(s.showAuxSeries);
         if (typeof s.showTrend === 'boolean') setShowTrend(s.showTrend);
         if (typeof s.emaSmoothing === 'number') setEmaSmoothing(s.emaSmoothing);
         else if (typeof s.smoothing === 'number') setEmaSmoothing(s.smoothing);
@@ -262,6 +314,7 @@ export default function JobLossGraph({ job }: Props) {
         smoothingMode,
         useLogScale,
         showRawSeries,
+        showAuxSeries,
         showTrend,
         emaSmoothing,
         showMovingAverage,
@@ -280,6 +333,7 @@ export default function JobLossGraph({ job }: Props) {
     smoothingMode,
     useLogScale,
     showRawSeries,
+    showAuxSeries,
     showTrend,
     emaSmoothing,
     showMovingAverage,
@@ -290,10 +344,22 @@ export default function JobLossGraph({ job }: Props) {
     enabled,
   ]);
 
+  const keyLabelByKey = useMemo(() => {
+    const labels: Record<string, string> = {};
+    for (const key of lossKeys) {
+      labels[key] = formatLossKeyLabel(key);
+    }
+    return labels;
+  }, [lossKeys]);
+
   const visibleLossKeys = useMemo(() => {
-    if (showRawSeries) return lossKeys;
-    return lossKeys.filter(k => !k.endsWith('/raw'));
-  }, [lossKeys, showRawSeries]);
+    return lossKeys.filter(key => {
+      if (!showRawSeries && key.endsWith('/raw')) return false;
+      if (!showAuxSeries && isAuxiliarySeriesKey(key)) return false;
+      if (!hasFinitePoints(series[key])) return false;
+      return true;
+    });
+  }, [lossKeys, showRawSeries, showAuxSeries, series]);
 
   // keep enabled map in sync with discovered keys. Only "loss/loss" is on by
   // default; every other metric starts deactivated (user can toggle it on).
@@ -356,6 +422,7 @@ export default function JobLossGraph({ job }: Props) {
 
     for (let ki = 0; ki < activeKeys.length; ki++) {
       const key = activeKeys[ki];
+      const keyLabel = keyLabelByKey[key] ?? key;
       const scaleKey = `y::${key}`;
       const pts: LossPoint[] = series[key] ?? [];
       const mapAll = new Map<number, number>();
@@ -395,7 +462,7 @@ export default function JobLossGraph({ job }: Props) {
       if (smoothingMode === 'ema') {
         data.push(smooth);
         seriesConfigs.push({
-          label: key,
+          label: keyLabel,
           scale: scaleKey,
           stroke: color,
           width: 2,
@@ -408,7 +475,7 @@ export default function JobLossGraph({ job }: Props) {
         if (showTrend && visiblePointCount >= 3) {
           data.push(trend);
           seriesConfigs.push({
-            label: `${key} (trend)`,
+            label: `${keyLabel} (trend)`,
             scale: scaleKey,
             stroke: colorDull,
             width: 2.5,
@@ -421,7 +488,7 @@ export default function JobLossGraph({ job }: Props) {
       } else {
         if (showRawPoints) {
           seriesConfigs.push({
-            label: `${key} (points)`,
+            label: `${keyLabel} (points)`,
             scale: scaleKey,
             stroke: color,
             width: 0,
@@ -436,7 +503,7 @@ export default function JobLossGraph({ job }: Props) {
         if (showMovingAverage && visiblePointCount >= 2) {
           data.push(movingAverage);
           seriesConfigs.push({
-            label: `${key} (MA)`,
+            label: keyLabel,
             scale: scaleKey,
             stroke: colorDull,
             width: 2,
@@ -455,6 +522,14 @@ export default function JobLossGraph({ job }: Props) {
         range: (_u, dataMin, dataMax) => {
           const c = yClipRef.current?.[scaleKey];
           if (c) return [c.min, c.max];
+          if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) return [0, 1];
+          if (dataMin === dataMax) {
+            if (useSeriesLogScale) {
+              const v = dataMin > 0 ? dataMin : 1e-6;
+              return [Math.max(v * 0.9, 1e-6), Math.max(v * 1.1, 1e-5)];
+            }
+            return [dataMin - 0.5, dataMax + 0.5];
+          }
           return [dataMin, dataMax];
         },
       };
@@ -463,7 +538,7 @@ export default function JobLossGraph({ job }: Props) {
         scale: scaleKey,
         side: ki % 2 === 0 ? 3 : 1, // alternate left / right
         stroke: color,
-        label: useLogScale && !useSeriesLogScale ? `${key} (lin)` : key,
+        label: useLogScale && !useSeriesLogScale ? `${keyLabel} (lin)` : keyLabel,
         labelSize: 14,
         // Only the first scale draws gridlines; overlaying grids from multiple
         // independent scales would be unreadable.
@@ -510,6 +585,7 @@ export default function JobLossGraph({ job }: Props) {
     showMovingAverage,
     showRawPoints,
     clipOutliers,
+    keyLabelByKey,
   ]);
 
   // Layout wrapper we measure for sizing — uPlot collapses its own mount node
@@ -723,6 +799,7 @@ export default function JobLossGraph({ job }: Props) {
                 </>
               )}
               <ToggleButton checked={showRawSeries} onClick={() => setShowRawSeries(v => !v)} label="Show raw series" />
+              <ToggleButton checked={showAuxSeries} onClick={() => setShowAuxSeries(v => !v)} label="Show aux series" />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
               <ToggleButton checked={clipOutliers} onClick={() => setClipOutliers(v => !v)} label="Clip outliers" />
             </div>
@@ -749,7 +826,7 @@ export default function JobLossGraph({ job }: Props) {
                     title={k}
                   >
                     <span className="inline-block h-2 w-2 rounded-full mr-2" style={{ background: strokeForKey(k) }} />
-                    {k}
+                    {keyLabelByKey[k] ?? k}
                   </button>
                 ))}
               </div>
