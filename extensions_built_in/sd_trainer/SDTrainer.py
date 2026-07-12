@@ -1410,21 +1410,18 @@ class SDTrainer(BaseSDTrainProcess):
             raw_loss_list.append(raw_loss)
             effective_loss_list.append(effective_loss)
 
-            dataset_config = file_item.dataset_config
-            dataset_name = getattr(dataset_config, "name", None)
-            if dataset_name is None:
-                dataset_name = dataset_config.dataset_path or dataset_config.folder_path or "unknown"
-            if dataset_name not in dataset_effective_loss:
-                dataset_effective_loss[dataset_name] = []
-            dataset_effective_loss[dataset_name].append(effective_loss)
+            dataset_key = self._dataset_metric_key(file_item, include_subdir=False)
+            if dataset_key not in dataset_effective_loss:
+                dataset_effective_loss[dataset_key] = []
+            dataset_effective_loss[dataset_key].append(effective_loss)
 
         raw_loss = torch.stack(raw_loss_list).mean()
         effective_loss = torch.stack(effective_loss_list).mean()
 
         self.additional_logs["loss/reg_consistency/raw"] = raw_loss.item()
         self.additional_logs["loss/reg_consistency/effective"] = effective_loss.item()
-        for dataset_name, dataset_losses in dataset_effective_loss.items():
-            self.additional_logs[f"loss_by_dataset/{dataset_name}/reg_consistency_effective"] = torch.stack(dataset_losses).mean().item()
+        for dataset_key, dataset_losses in dataset_effective_loss.items():
+            self.additional_logs[f"loss_by_dataset/{dataset_key}/reg_consistency_effective"] = torch.stack(dataset_losses).mean().item()
 
         mode = "add" if len(mode_set) > 1 else list(mode_set)[0]
         if mode == "replace":
