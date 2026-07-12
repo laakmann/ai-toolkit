@@ -531,7 +531,6 @@ export default function JobLossGraph({ job }: Props) {
         <div className="flex items-center gap-2">
             <div className="h-2 w-2 rounded-full bg-blue-400" />
             <h2 className="text-gray-100 text-sm font-medium">Loss graph</h2>
-            <span className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300">ui-patch-3</span>
             <span className="text-xs text-gray-400">
             {status === 'loading' && 'Loading...'}
             {status === 'refreshing' && 'Refreshing...'}
