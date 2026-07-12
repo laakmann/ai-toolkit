@@ -303,7 +303,13 @@ export default function JobLossGraph({ job }: Props) {
       const map = useSeriesLogScale ? mapLog : mapAll;
       const raw: (number | null)[] = xs.map(s => (map.has(s) ? (map.get(s) as number) : null));
       const visiblePointCount = raw.reduce<number>((n, v) => (v === null || !Number.isFinite(v) ? n : n + 1), 0);
-      const showPoints = visiblePointCount > 0 && visiblePointCount <= 2;
+      let contiguousSegmentCount = 0;
+      for (let i = 1; i < raw.length; i++) {
+        if (raw[i] !== null && raw[i - 1] !== null) contiguousSegmentCount += 1;
+      }
+      const isolatedPointsOnly = visiblePointCount > 0 && contiguousSegmentCount === 0;
+      const showPoints = visiblePointCount > 0 && (visiblePointCount <= 2 || isolatedPointsOnly);
+      const spanGaps = isolatedPointsOnly;
       const smooth = emaWithNulls(raw, alpha);
       const fullSmooth = emaWithNulls(raw, fullAlpha);
 
@@ -319,7 +325,7 @@ export default function JobLossGraph({ job }: Props) {
         scale: scaleKey,
         stroke: color,
         width: 2,
-        spanGaps: false,
+        spanGaps,
         points: showPoints ? { show: true, size: 6 } : { show: false },
         value: (_u, value) => formatNum(value),
       });
@@ -523,9 +529,10 @@ export default function JobLossGraph({ job }: Props) {
     <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col h-full">
       <div className="bg-gray-800 px-4 py-3 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2">
-          <div className="h-2 w-2 rounded-full bg-blue-400" />
-          <h2 className="text-gray-100 text-sm font-medium">Loss graph</h2>
-          <span className="text-xs text-gray-400">
+            <div className="h-2 w-2 rounded-full bg-blue-400" />
+            <h2 className="text-gray-100 text-sm font-medium">Loss graph</h2>
+            <span className="text-[10px] px-1.5 py-0.5 rounded border border-amber-500/40 text-amber-300">ui-patch-3</span>
+            <span className="text-xs text-gray-400">
             {status === 'loading' && 'Loading...'}
             {status === 'refreshing' && 'Refreshing...'}
             {status === 'error' && 'Error'}
