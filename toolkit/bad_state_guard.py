@@ -1,5 +1,6 @@
 import os
 import random
+import math
 from typing import Dict, List, Tuple
 
 import torch
@@ -134,9 +135,35 @@ class BadStatePool:
         image_tensor = (image_tensor * 2.0) - 1.0
         return image_tensor
 
-    def _encode_bad_state_latent(self, image_path: str, latent_h: int, latent_w: int) -> torch.Tensor:
-        pixel_h = latent_h * self.vae_scale_factor
-        pixel_w = latent_w * self.vae_scale_factor
+    def _infer_patch_factor(self, target_latents: torch.Tensor) -> int:
+        target_channels = int(target_latents.shape[1])
+
+        ae_channels = None
+        vae_params = getattr(self.sd.vae, "params", None)
+        if vae_params is not None:
+            ae_channels = getattr(vae_params, "z_channels", None)
+
+        if ae_channels is None:
+            config = getattr(self.sd.vae, "config", None)
+            if config is not None:
+                ae_channels = getattr(config, "latent_channels", None)
+                if ae_channels is None:
+                    try:
+                        ae_channels = config["latent_channels"]
+                    except Exception:
+                        ae_channels = None
+
+        if isinstance(ae_channels, int) and ae_channels > 0 and target_channels % ae_channels == 0:
+            ratio = target_channels // ae_channels
+            patch = int(math.sqrt(ratio))
+            if patch > 1 and (patch * patch) == ratio:
+                return patch
+
+        return 1
+
+    def _encode_bad_state_latent(self, image_path: str, latent_h: int, latent_w: int, patch_factor: int = 1) -> torch.Tensor:
+        pixel_h = latent_h * self.vae_scale_factor * patch_factor
+        pixel_w = latent_w * self.vae_scale_factor * patch_factor
         image_tensor = self._load_image_tensor(image_path, target_width=pixel_w, target_height=pixel_h)
         batched_image = image_tensor.unsqueeze(0).to(self.sd.device_torch, dtype=self.sd.torch_dtype)
         with torch.no_grad():
@@ -152,6 +179,7 @@ class BadStatePool:
         latent_w = target_latents.shape[-1]
         target_dtype = target_latents.dtype
         target_device = target_latents.device
+        patch_factor = self._infer_patch_factor(target_latents)
 
         image_path = self._pick_image_path(latent_w, latent_h)
         cache_key = (image_path, latent_h, latent_w)
@@ -160,7 +188,7 @@ class BadStatePool:
             bad_latent = self.latent_cache.get(cache_key, None)
 
         if bad_latent is None:
-            bad_latent = self._encode_bad_state_latent(image_path, latent_h, latent_w)
+            bad_latent = self._encode_bad_state_latent(image_path, latent_h, latent_w, patch_factor=patch_factor)
             if self.cache_latents:
                 self.latent_cache[cache_key] = bad_latent.detach().cpu()
 
