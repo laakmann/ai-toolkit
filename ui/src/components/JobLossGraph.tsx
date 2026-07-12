@@ -42,59 +42,31 @@ function computeCanvasSize(host: HTMLElement): { width: number; height: number }
   return { width, height: Math.max(MIN_CANVAS_HEIGHT, height - legendH) };
 }
 
-// One-directional bias-corrected EMA. The accumulator starts at 0 and each
-// output is divided by w = 1-(1-alpha)^n (n = valid points seen so far) so early
-// outputs reflect the running mean rather than the raw accumulator. `w` doubles
-// as a confidence weight (→0 with one point seen, →1 once warmed up) used to
-// combine the two passes below. Nulls are preserved as gaps and do not advance
-// the average. `reverse` walks the series back-to-front (the backward pass).
-function emaPass(
-  ys: (number | null)[],
-  alpha: number,
-  reverse: boolean,
-): { vals: (number | null)[]; weights: number[] } {
-  const vals: (number | null)[] = new Array(ys.length).fill(null);
-  const weights: number[] = new Array(ys.length).fill(0);
-  let s = 0; // raw EMA accumulator
-  let n = 0; // valid points incorporated so far
-  const start = reverse ? ys.length - 1 : 0;
-  const step = reverse ? -1 : 1;
-  for (let i = start; i >= 0 && i < ys.length; i += step) {
-    const v = ys[i];
-    if (v === null || !Number.isFinite(v)) continue;
-    s = alpha * (v as number) + (1 - alpha) * s;
-    n += 1;
-    const w = 1 - Math.pow(1 - alpha, n);
-    vals[i] = s / w;
-    weights[i] = w;
-  }
-  return { vals, weights };
-}
+// Trailing moving average over the last N valid samples in the series.
+// Nulls remain null (gaps) and do not consume window capacity.
+function trailingMovingAverageWithNulls(ys: (number | null)[], window: number): (number | null)[] {
+  const out: (number | null)[] = new Array(ys.length).fill(null);
+  const w = Math.max(1, window | 0);
+  const queue: number[] = [];
+  let sum = 0;
 
-// Zero-phase (forward-backward) EMA, combined by each pass's confidence weight.
-// A one-sided EMA pins the first point to its raw value and the last point is a
-// pure causal (lagging) estimate. Running a forward and backward pass and
-// blending them by how much data each has seen at that index gives the best of
-// both: at the start the forward pass has ~1 point (distrusted) so the
-// backward, future-informed pass dominates; at the latest points the backward
-// pass has ~1 point so the forward (causal) estimate dominates; the middle is
-// ~50/50, which also cancels EMA's lag. Nulls stay null (both passes align).
-function emaWithNulls(ys: (number | null)[], alpha: number): (number | null)[] {
-  const fwd = emaPass(ys, alpha, false);
-  const bwd = emaPass(ys, alpha, true);
-  const out: (number | null)[] = new Array(ys.length);
   for (let i = 0; i < ys.length; i++) {
-    const f = fwd.vals[i];
-    const b = bwd.vals[i];
-    if (f === null || b === null) {
+    const v = ys[i];
+    if (v === null || !Number.isFinite(v)) {
       out[i] = null;
       continue;
     }
-    const wf = fwd.weights[i];
-    const wb = bwd.weights[i];
-    const wsum = wf + wb;
-    out[i] = wsum > 0 ? (wf * (f as number) + wb * (b as number)) / wsum : ((f as number) + (b as number)) / 2;
+
+    const value = v as number;
+    queue.push(value);
+    sum += value;
+    if (queue.length > w) {
+      sum -= queue.shift() as number;
+    }
+
+    out[i] = sum / queue.length;
   }
+
   return out;
 }
 
@@ -126,8 +98,9 @@ function strokeForKey(key: string) {
 // series are visible. Zoom / highlighted window is intentionally NOT persisted.
 interface PersistedSettings {
   useLogScale: boolean;
-  showTrend: boolean;
-  smoothing: number;
+  showMovingAverage: boolean;
+  showRawPoints: boolean;
+  maWindow: number;
   plotStride: number;
   clipOutliers: boolean;
   enabled: Record<string, boolean>;
@@ -153,10 +126,11 @@ export default function JobLossGraph({ job }: Props) {
 
   // Controls
   const [useLogScale, setUseLogScale] = useState(false);
-  const [showTrend, setShowTrend] = useState(true);
+  const [showMovingAverage, setShowMovingAverage] = useState(true);
+  const [showRawPoints, setShowRawPoints] = useState(true);
 
-  // 0..100 slider. 100 = no smoothing, 0 = heavy smoothing.
-  const [smoothing, setSmoothing] = useState(80);
+  // Number of recent valid samples used per series for central tendency.
+  const [maWindow, setMaWindow] = useState(25);
 
   // UI-only downsample for rendering speed
   const [plotStride, setPlotStride] = useState(1);
@@ -193,10 +167,16 @@ export default function JobLossGraph({ job }: Props) {
     try {
       const raw = localStorage.getItem(key);
       if (raw) {
-        const s = JSON.parse(raw) as Partial<PersistedSettings>;
+        const s = JSON.parse(raw) as Partial<PersistedSettings> & { showTrend?: boolean; smoothing?: number };
         if (typeof s.useLogScale === 'boolean') setUseLogScale(s.useLogScale);
-        if (typeof s.showTrend === 'boolean') setShowTrend(s.showTrend);
-        if (typeof s.smoothing === 'number') setSmoothing(s.smoothing);
+        if (typeof s.showMovingAverage === 'boolean') setShowMovingAverage(s.showMovingAverage);
+        else if (typeof s.showTrend === 'boolean') setShowMovingAverage(s.showTrend);
+        if (typeof s.showRawPoints === 'boolean') setShowRawPoints(s.showRawPoints);
+        if (typeof s.maWindow === 'number') setMaWindow(s.maWindow);
+        else if (typeof s.smoothing === 'number') {
+          const mappedWindow = Math.round(2 + clamp01(s.smoothing / 100) * 198);
+          setMaWindow(mappedWindow);
+        }
         if (typeof s.plotStride === 'number') setPlotStride(s.plotStride);
         if (typeof s.clipOutliers === 'boolean') setClipOutliers(s.clipOutliers);
         if (s.enabled && typeof s.enabled === 'object') {
@@ -216,12 +196,20 @@ export default function JobLossGraph({ job }: Props) {
     const key = settingsStorageKey();
     if (!key) return;
     try {
-      const payload: PersistedSettings = { useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled };
+      const payload: PersistedSettings = {
+        useLogScale,
+        showMovingAverage,
+        showRawPoints,
+        maWindow,
+        plotStride,
+        clipOutliers,
+        enabled,
+      };
       localStorage.setItem(key, JSON.stringify(payload));
     } catch {
       // ignore unavailable storage
     }
-  }, [hydrated, useLogScale, showTrend, smoothing, plotStride, clipOutliers, enabled]);
+  }, [hydrated, useLogScale, showMovingAverage, showRawPoints, maWindow, plotStride, clipOutliers, enabled]);
 
   // keep enabled map in sync with discovered keys. Only "loss/loss" is on by
   // default; every other metric starts deactivated (user can toggle it on).
@@ -246,9 +234,6 @@ export default function JobLossGraph({ job }: Props) {
   // Build uPlot-aligned data + series configs.
   const built = useMemo(() => {
     const stride = Math.max(1, plotStride | 0);
-    const t = clamp01(smoothing / 100);
-    const alpha = 1.0 - t * 0.98; // 1.0 -> 0.02
-    const fullAlpha = 0.005;
 
     // Union of all steps across active series.
     const stepSet = new Set<number>();
@@ -295,39 +280,47 @@ export default function JobLossGraph({ job }: Props) {
         map.set(p.step, p.value as number);
       }
       const raw: (number | null)[] = xs.map(s => (map.has(s) ? (map.get(s) as number) : null));
-      const smooth = emaWithNulls(raw, alpha);
-      const fullSmooth = emaWithNulls(raw, fullAlpha);
+      const movingAverage = trailingMovingAverageWithNulls(raw, maWindow);
 
       const color = strokeForKey(key);
       const colorDull = dulledColor(color);
 
+      const visiblePointCount = raw.reduce<number>((n, v) => (v === null || !Number.isFinite(v) ? n : n + 1), 0);
+      let contiguousSegmentCount = 0;
+      for (let i = 1; i < raw.length; i++) {
+        if (raw[i] !== null && raw[i - 1] !== null) contiguousSegmentCount += 1;
+      }
+      const isolatedPointsOnly = visiblePointCount > 0 && contiguousSegmentCount === 0;
+      const spanGaps = isolatedPointsOnly;
+
       const colArrays: (number | null)[][] = [];
 
-      // Main series: smoothed by the slider (slider at 100% = raw), always shown.
-      data.push(smooth);
-      seriesConfigs.push({
-        label: key,
-        scale: scaleKey,
-        stroke: color,
-        width: 2,
-        spanGaps: false,
-        points: { show: false },
-        value: (_u, value) => formatNum(value),
-      });
-      colArrays.push(smooth);
-
-      if (showTrend) {
-        data.push(fullSmooth);
+      if (showRawPoints) {
         seriesConfigs.push({
-          label: `${key} (trend)`,
+          label: `${key} (points)`,
+          scale: scaleKey,
+          stroke: color,
+          width: 0,
+          spanGaps: false,
+          points: { show: true, size: 4, width: 0 },
+          value: (_u, value) => formatNum(value),
+        });
+        data.push(raw);
+        colArrays.push(raw);
+      }
+
+      if (showMovingAverage && visiblePointCount >= 2) {
+        data.push(movingAverage);
+        seriesConfigs.push({
+          label: `${key} (MA ${maWindow})`,
           scale: scaleKey,
           stroke: colorDull,
-          width: 2.5,
-          spanGaps: false,
+          width: 2,
+          spanGaps,
           points: { show: false },
           value: (_u, value) => formatNum(value),
         });
-        colArrays.push(fullSmooth);
+        colArrays.push(movingAverage);
       }
 
       scaleArrays[scaleKey] = colArrays;
@@ -379,7 +372,7 @@ export default function JobLossGraph({ job }: Props) {
     }
 
     return { data: data as uPlot.AlignedData, seriesConfigs, scales, axes, yClip };
-  }, [series, activeKeys, smoothing, plotStride, windowSize, useLogScale, showTrend, clipOutliers]);
+  }, [series, activeKeys, maWindow, plotStride, windowSize, useLogScale, showMovingAverage, showRawPoints, clipOutliers]);
 
   // Layout wrapper we measure for sizing — uPlot collapses its own mount node
   // to width:min-content, so we can't read sizes off it.
@@ -403,8 +396,8 @@ export default function JobLossGraph({ job }: Props) {
   // axis distribution changes. Data updates go through setData.
   const hasData = (built.data[0]?.length ?? 0) > 1;
   const structuralKey = useMemo(
-    () => `${activeKeys.join('|')}|trend=${showTrend}|log=${useLogScale}|has=${hasData}`,
-    [activeKeys, showTrend, useLogScale, hasData],
+    () => `${activeKeys.join('|')}|ma=${showMovingAverage}|pts=${showRawPoints}|log=${useLogScale}|has=${hasData}`,
+    [activeKeys, showMovingAverage, showRawPoints, useLogScale, hasData],
   );
 
   useEffect(() => {
@@ -569,7 +562,16 @@ export default function JobLossGraph({ job }: Props) {
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
             <label className="block text-xs text-gray-400 mb-2">Display</label>
             <div className="flex flex-wrap gap-2">
-              <ToggleButton checked={showTrend} onClick={() => setShowTrend(v => !v)} label="Trend" />
+              <ToggleButton
+                checked={showMovingAverage}
+                onClick={() => setShowMovingAverage(v => (showRawPoints ? !v : true))}
+                label="Moving avg"
+              />
+              <ToggleButton
+                checked={showRawPoints}
+                onClick={() => setShowRawPoints(v => (showMovingAverage ? !v : true))}
+                label="Raw points"
+              />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
               <ToggleButton checked={clipOutliers} onClick={() => setClipOutliers(v => !v)} label="Clip outliers" />
             </div>
@@ -605,15 +607,15 @@ export default function JobLossGraph({ job }: Props) {
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
             <div className="flex items-center justify-between mb-1">
-              <label className="block text-xs text-gray-400">Smoothing</label>
-              <span className="text-xs text-gray-300">{smoothing}%</span>
+              <label className="block text-xs text-gray-400">Moving average window</label>
+              <span className="text-xs text-gray-300">{maWindow} pts</span>
             </div>
             <input
               type="range"
-              min={0}
-              max={100}
-              value={smoothing}
-              onChange={e => setSmoothing(Number(e.target.value))}
+              min={2}
+              max={200}
+              value={maWindow}
+              onChange={e => setMaWindow(Number(e.target.value))}
               className="w-full accent-blue-500"
             />
           </div>
