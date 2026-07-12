@@ -303,7 +303,7 @@ export default function JobLossGraph({ job }: Props) {
       const useSeriesLogScale = useLogScale && positiveCount >= 2;
       const map = useSeriesLogScale ? mapLog : mapAll;
       const raw: (number | null)[] = xs.map(s => (map.has(s) ? (map.get(s) as number) : null));
-      const visiblePointCount = raw.reduce((n, v) => (v === null || !Number.isFinite(v) ? n : n + 1), 0);
+      const visiblePointCount = raw.reduce<number>((n, v) => (v === null || !Number.isFinite(v) ? n : n + 1), 0);
       const showPoints = visiblePointCount > 0 && visiblePointCount <= 2;
       const smooth = emaWithNulls(raw, alpha);
       const fullSmooth = emaWithNulls(raw, fullAlpha);
