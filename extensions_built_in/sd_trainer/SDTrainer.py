@@ -85,6 +85,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         self.bad_state_pool: Optional[BadStatePool] = None
+        for idx, dataset in enumerate(self.dataset_configs):
+            setattr(dataset, "_aitk_dataset_seq", idx + 1)
         self._dataset_sequence_by_id = {id(dataset): idx + 1 for idx, dataset in enumerate(self.dataset_configs)}
         
         if self.train_config.diff_output_preservation:
@@ -1274,6 +1276,9 @@ class SDTrainer(BaseSDTrainProcess):
         return cleaned or "unknown"
 
     def _dataset_sequence(self, dataset_config) -> int:
+        seq = getattr(dataset_config, "_aitk_dataset_seq", None)
+        if isinstance(seq, int) and seq > 0:
+            return seq
         return self._dataset_sequence_by_id.get(id(dataset_config), 0)
 
     def _dataset_label(self, dataset_config) -> str:
