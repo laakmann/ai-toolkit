@@ -1,5 +1,5 @@
 import torch
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
 from toolkit.basic import value_map
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -8,7 +8,7 @@ from toolkit.stable_diffusion_model import StableDiffusion
 from toolkit.train_tools import get_torch_dtype
 from toolkit.config_modules import TrainConfig
 
-GuidanceType = Literal["targeted", "polarity", "targeted_polarity", "direct"]
+GuidanceType = Literal["targeted", "polarity", "targeted_polarity", "direct", "tnt", "targeted_flow"]
 
 DIFFERENTIAL_SCALER = 0.2
 
@@ -609,7 +609,6 @@ def get_guided_tnt(
 
     return loss
 
-
 def compute_targeted_flow_loss(
     *,
     target_latents: torch.Tensor,
@@ -626,7 +625,10 @@ def compute_targeted_flow_loss(
     prior_pred=None,
     scaler=None,
     train_config: Optional[TrainConfig] = None,
-) -> torch.Tensor:
+    bad_state_guard_cfg=None,
+    current_step: Optional[int] = None,
+    return_details: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
     if not sd.is_flow_matching:
         raise ValueError("targeted_flow only works on flow matching models")
 
@@ -706,12 +708,70 @@ def compute_targeted_flow_loss(
     )
 
     # target our baseline + differential noise target
-    pred_loss = torch.nn.functional.mse_loss(
+    base_loss = torch.nn.functional.mse_loss(
         prediction.float(),
         target_pred.float()
     )
+    total_loss = base_loss
 
-    return pred_loss
+    details: Dict[str, Any] = {
+        "base_loss": float(base_loss.detach().item()),
+        "repel_triggered": 0.0,
+        "repel_score": 0.0,
+        "repel_raw": 0.0,
+        "repel_effective": 0.0,
+        "repel_scale": 1.0,
+    }
+
+    if bad_state_guard_cfg is not None:
+        guard_mode = getattr(bad_state_guard_cfg, "mode", "standard")
+        if guard_mode == "adaptive_repel":
+            warmup_steps = int(getattr(bad_state_guard_cfg, "warmup_steps", 0) or 0)
+            if current_step is None or current_step >= warmup_steps:
+                predicted_latents = noise - prediction
+                target_latents_detached = target_latents.detach()
+                source_latents_detached = source_latents.detach()
+
+                reduction_dims = tuple(range(1, len(predicted_latents.shape)))
+                d_target = torch.nn.functional.mse_loss(
+                    predicted_latents.float(),
+                    target_latents_detached.float(),
+                    reduction="none",
+                ).mean(dim=reduction_dims)
+                d_source = torch.nn.functional.mse_loss(
+                    predicted_latents.float(),
+                    source_latents_detached.float(),
+                    reduction="none",
+                ).mean(dim=reduction_dims)
+
+                # Positive values mean prediction is closer to source (bad-state) than target.
+                bad_state_score = d_target - d_source
+                trigger_threshold = float(getattr(bad_state_guard_cfg, "trigger_threshold", 0.0) or 0.0)
+                repel_margin = float(getattr(bad_state_guard_cfg, "repel_margin", 0.0) or 0.0)
+                repel_activation = torch.relu(bad_state_score - (trigger_threshold + repel_margin))
+                repel_raw = repel_activation.mean()
+
+                max_repel_scale = float(getattr(bad_state_guard_cfg, "max_repel_scale", 3.0) or 3.0)
+                repel_scale = torch.clamp(
+                    1.0 + repel_activation.detach().mean(),
+                    min=1.0,
+                    max=max_repel_scale,
+                )
+                repel_weight = float(getattr(bad_state_guard_cfg, "repel_weight", 1.0) or 1.0)
+                repel_effective = repel_raw * repel_weight * repel_scale
+                total_loss = base_loss + repel_effective
+
+                details["repel_triggered"] = float((repel_activation.detach() > 0).any().item())
+                details["repel_score"] = float(bad_state_score.detach().mean().item())
+                details["repel_raw"] = float(repel_raw.detach().item())
+                details["repel_effective"] = float(repel_effective.detach().item())
+                details["repel_scale"] = float(repel_scale.detach().item())
+
+    if return_details:
+        details["total_loss"] = float(total_loss.detach().item())
+        return total_loss, details
+
+    return total_loss
 
 def targeted_flow_guidance(
     noisy_latents: torch.Tensor,
@@ -728,6 +788,9 @@ def targeted_flow_guidance(
     prior_pred=None,
     scaler=None,
     train_config=None,
+    bad_state_guard_cfg=None,
+    current_step: Optional[int] = None,
+    return_details: bool = False,
     **kwargs
 ):
     return compute_targeted_flow_loss(
@@ -745,6 +808,9 @@ def targeted_flow_guidance(
         prior_pred=prior_pred,
         scaler=scaler,
         train_config=train_config,
+        bad_state_guard_cfg=bad_state_guard_cfg,
+        current_step=current_step,
+        return_details=return_details,
     )
 
 

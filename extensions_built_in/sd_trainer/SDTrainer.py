@@ -1519,7 +1519,10 @@ class SDTrainer(BaseSDTrainProcess):
         if not self.sd.is_flow_matching:
             raise ValueError("bad_state_guard currently requires a flow-matching model")
         if cfg.loss_type != "targeted_flow":
-            raise ValueError(f"Unsupported bad_state_guard.loss_type: {cfg.loss_type}")
+            raise ValueError(
+                f"Unsupported bad_state_guard.loss_type: {cfg.loss_type}. "
+                f"Current supported values: targeted_flow"
+            )
         if is_reg and not cfg.apply_to_reg:
             return loss
         if random.random() >= cfg.probability:
@@ -1530,7 +1533,7 @@ class SDTrainer(BaseSDTrainProcess):
         original_unconditional_latents = batch.unconditional_latents
         batch.unconditional_latents = bad_latents
         try:
-            guard_loss = targeted_flow_guidance(
+            guard_loss, guard_details = targeted_flow_guidance(
                 noisy_latents=noisy_latents,
                 conditional_embeds=conditional_embeds,
                 match_adapter_assist=match_adapter_assist,
@@ -1542,11 +1545,19 @@ class SDTrainer(BaseSDTrainProcess):
                 sd=self.sd,
                 unconditional_embeds=unconditional_embeds,
                 train_config=self.train_config,
+                bad_state_guard_cfg=cfg,
+                current_step=self.step_num,
+                return_details=True,
             )
         finally:
             batch.unconditional_latents = original_unconditional_latents
 
         effective_guard_loss = guard_loss * cfg.multiplier
+        self.additional_logs["bad_state_guard/repel_triggered"] = guard_details.get("repel_triggered", 0.0)
+        self.additional_logs["bad_state_guard/repel_score"] = guard_details.get("repel_score", 0.0)
+        self.additional_logs["loss/bad_state_guard/repel_raw"] = guard_details.get("repel_raw", 0.0)
+        self.additional_logs["loss/bad_state_guard/repel_effective"] = guard_details.get("repel_effective", 0.0) * cfg.multiplier
+        self.additional_logs["bad_state_guard/repel_scale"] = guard_details.get("repel_scale", 1.0)
         self.additional_logs["loss/bad_state_guard/raw"] = guard_loss.item()
         self.additional_logs["loss/bad_state_guard/effective"] = effective_guard_loss.item()
         self.additional_logs["bad_state_guard/applied"] = 1.0
