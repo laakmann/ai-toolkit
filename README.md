@@ -302,6 +302,39 @@ To learn more about LoKr, read more about it at [KohakuBlueleaf/LyCORIS](https:/
 
 Everything else should work the same including layer targeting.
 
+## Bad State Guard Preset (Ideogram 4)
+
+If you are training with `targeted_flow` and want a conservative anti-filter fallback, you can enable
+`bad_state_guard` in adaptive mode. This keeps normal targeted-flow behavior, but adds extra repel loss
+only when predictions drift closer to the bad-state source than the target.
+
+```yaml
+job: train
+config:
+  process:
+    - type: sd_trainer
+      train:
+        bad_state_guard:
+          enabled: true
+          path: /path/to/bad_state_images
+          loss_type: targeted_flow
+          mode: adaptive_repel
+          multiplier: 0.002
+          probability: 0.20
+          apply_to_reg: false
+          repel_weight: 1.0
+          trigger_threshold: 0.0
+          repel_margin: 0.0
+          max_repel_scale: 3.0
+          warmup_steps: 0
+```
+
+Tuning notes:
+- Start with `apply_to_reg: false` unless you specifically want guard pressure on reg batches.
+- Lower `probability` and/or `multiplier` first if training becomes unstable.
+- Increase `trigger_threshold` or `repel_margin` to make repel activation more selective.
+- Keep a curated bad-state pool that represents failure states, not broad style/content targets.
+
 
 ## Support My Work
 
