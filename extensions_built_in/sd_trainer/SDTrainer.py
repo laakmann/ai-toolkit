@@ -84,9 +84,24 @@ class SDTrainer(BaseSDTrainProcess):
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         self.bad_state_pool: Optional[BadStatePool] = None
-        for idx, dataset in enumerate(self.dataset_configs):
-            setattr(dataset, "_aitk_dataset_seq", idx + 1)
-        self._dataset_sequence_by_id = {id(dataset): idx + 1 for idx, dataset in enumerate(self.dataset_configs)}
+        self._dataset_series_key_by_id = {}
+        self._dataset_sequence_by_series_key = {}
+        self._dataset_label_by_series_key = {}
+        next_dataset_seq = 1
+        for dataset in self.dataset_configs:
+            series_key = self._dataset_series_key(dataset)
+            if series_key not in self._dataset_sequence_by_series_key:
+                self._dataset_sequence_by_series_key[series_key] = next_dataset_seq
+                self._dataset_label_by_series_key[series_key] = self._dataset_label(dataset)
+                next_dataset_seq += 1
+            dataset_seq = self._dataset_sequence_by_series_key[series_key]
+            setattr(dataset, "_aitk_dataset_seq", dataset_seq)
+            setattr(dataset, "_aitk_dataset_series_key", series_key)
+            self._dataset_series_key_by_id[id(dataset)] = series_key
+        self._dataset_sequence_by_id = {
+            id(dataset): self._dataset_sequence_by_series_key[self._dataset_series_key_by_id[id(dataset)]]
+            for dataset in self.dataset_configs
+        }
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -1274,7 +1289,39 @@ class SDTrainer(BaseSDTrainProcess):
             cleaned = cleaned[:max_len].rstrip("-_")
         return cleaned or "unknown"
 
+    def _dataset_series_key(self, dataset_config) -> str:
+        dataset_root = self._dataset_root(dataset_config)
+        if dataset_root is not None:
+            normalized_root = os.path.normcase(os.path.normpath(dataset_root))
+            return f"root:{normalized_root}"
+
+        dataset_name = dataset_config.name
+        if dataset_name is not None and str(dataset_name).strip() != "":
+            return f"name:{self._sanitize_metric_token(dataset_name, max_len=48)}"
+
+        seq = getattr(dataset_config, "_aitk_dataset_seq", None)
+        if isinstance(seq, int) and seq > 0:
+            return f"seq:{seq}"
+
+        return f"id:{id(dataset_config)}"
+
+    def _dataset_series_key_for_config(self, dataset_config) -> str:
+        series_key = getattr(dataset_config, "_aitk_dataset_series_key", None)
+        if isinstance(series_key, str) and series_key != "":
+            return series_key
+
+        series_key = self._dataset_series_key_by_id.get(id(dataset_config))
+        if series_key is not None:
+            return series_key
+
+        return self._dataset_series_key(dataset_config)
+
     def _dataset_sequence(self, dataset_config) -> int:
+        series_key = self._dataset_series_key_for_config(dataset_config)
+        mapped_seq = self._dataset_sequence_by_series_key.get(series_key)
+        if isinstance(mapped_seq, int) and mapped_seq > 0:
+            return mapped_seq
+
         seq = getattr(dataset_config, "_aitk_dataset_seq", None)
         if isinstance(seq, int) and seq > 0:
             return seq
@@ -1305,7 +1352,11 @@ class SDTrainer(BaseSDTrainProcess):
 
     def _dataset_metric_prefix(self, dataset_config) -> str:
         seq = self._dataset_sequence(dataset_config)
-        return f"d{seq}/{self._dataset_label(dataset_config)}"
+        series_key = self._dataset_series_key_for_config(dataset_config)
+        dataset_label = self._dataset_label_by_series_key.get(series_key)
+        if dataset_label is None:
+            dataset_label = self._dataset_label(dataset_config)
+        return f"d{seq}/{dataset_label}"
 
     def _dataset_subdir_label(self, file_item: FileItemDTO) -> str:
         file_dir = os.path.dirname(str(file_item.path))
