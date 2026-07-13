@@ -350,6 +350,26 @@ class DecoratorConfig:
         self.num_tokens: str = kwargs.get('num_tokens', 4)
 
 
+class BadStateGuardConfig:
+    def __init__(self, **kwargs):
+        self.enabled = kwargs.get("enabled", False)
+        self.path = kwargs.get("path", None)
+        self.multiplier = kwargs.get("multiplier", 0.002)
+        self.probability = kwargs.get("probability", 0.20)
+        self.apply_to_reg = kwargs.get("apply_to_reg", False)
+        self.match_batch_resolution = kwargs.get("match_batch_resolution", True)
+        self.cache_latents = kwargs.get("cache_latents", True)
+        self.match_strategy = kwargs.get("match_strategy", "nearest_aspect")  # nearest_aspect | random
+        self.resize_mode = kwargs.get("resize_mode", "contain")  # contain | cover | stretch
+        self.loss_type = kwargs.get("loss_type", "targeted_flow")
+        self.mode = kwargs.get("mode", "standard")  # standard | adaptive_repel
+        self.repel_weight = kwargs.get("repel_weight", 1.0)
+        self.repel_margin = kwargs.get("repel_margin", 0.0)
+        self.trigger_threshold = kwargs.get("trigger_threshold", 0.0)
+        self.max_repel_scale = kwargs.get("max_repel_scale", 3.0)
+        self.warmup_steps = kwargs.get("warmup_steps", 0)
+
+
 ContentOrStyleType = Literal['balanced', 'style', 'content']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 

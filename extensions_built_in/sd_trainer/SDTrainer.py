@@ -1408,6 +1408,160 @@ class SDTrainer(BaseSDTrainProcess):
             if has_raw_loss:
                 self.additional_logs[f"loss_by_dataset/{dataset_key}/raw"] = raw_loss.item()
 
+    def _resolve_reg_consistency_settings(self, file_item: FileItemDTO):
+        dataset_config = file_item.dataset_config
+        mode = dataset_config.reg_consistency_mode
+        if mode is None:
+            mode = self.train_config.reg_consistency_mode
+        loss_type = dataset_config.reg_consistency_loss_type
+        if loss_type is None:
+            loss_type = self.train_config.reg_consistency_loss_type
+        tolerance = dataset_config.reg_consistency_tolerance
+        if tolerance is None:
+            tolerance = self.train_config.reg_consistency_tolerance
+        smooth_l1_beta = dataset_config.reg_consistency_smooth_l1_beta
+        if smooth_l1_beta is None:
+            smooth_l1_beta = self.train_config.reg_consistency_smooth_l1_beta
+        dataset_reg_consistency_multiplier = dataset_config.reg_consistency_multiplier
+        if dataset_reg_consistency_multiplier is None:
+            dataset_reg_consistency_multiplier = 1.0
+        effective_multiplier = (
+            self.train_config.reg_consistency_multiplier
+            * dataset_reg_consistency_multiplier
+            * dataset_config.loss_multiplier
+        )
+        return mode, loss_type, tolerance, smooth_l1_beta, effective_multiplier
+
+    def _apply_reg_consistency_loss(
+        self,
+        *,
+        loss: torch.Tensor,
+        noise_pred: torch.Tensor,
+        prior_pred: torch.Tensor,
+        batch: DataLoaderBatchDTO,
+    ) -> torch.Tensor:
+        reg_indices = [idx for idx, file_item in enumerate(batch.file_items) if file_item.is_reg]
+        if len(reg_indices) == 0:
+            return loss
+
+        raw_loss_list = []
+        effective_loss_list = []
+        mode_set = set()
+        dataset_effective_loss = {}
+
+        for idx in reg_indices:
+            file_item = batch.file_items[idx]
+            mode, loss_type, tolerance, smooth_l1_beta, effective_multiplier = self._resolve_reg_consistency_settings(file_item)
+            mode_set.add(mode)
+            raw_loss = compute_reg_consistency_loss(
+                noise_pred[idx:idx + 1],
+                prior_pred[idx:idx + 1],
+                loss_type=loss_type,
+                tolerance=tolerance,
+                smooth_l1_beta=smooth_l1_beta,
+            )
+            effective_loss = raw_loss * effective_multiplier
+
+            raw_loss_list.append(raw_loss)
+            effective_loss_list.append(effective_loss)
+
+            dataset_key = self._dataset_metric_key(file_item, include_subdir=False)
+            if dataset_key not in dataset_effective_loss:
+                dataset_effective_loss[dataset_key] = []
+            dataset_effective_loss[dataset_key].append(effective_loss)
+
+        raw_loss = torch.stack(raw_loss_list).mean()
+        effective_loss = torch.stack(effective_loss_list).mean()
+
+        self.additional_logs["loss/reg_consistency/raw"] = raw_loss.item()
+        self.additional_logs["loss/reg_consistency/effective"] = effective_loss.item()
+        for dataset_key, dataset_losses in dataset_effective_loss.items():
+            self.additional_logs[f"loss_by_dataset/{dataset_key}/reg_consistency_effective"] = torch.stack(dataset_losses).mean().item()
+
+        mode = "add" if len(mode_set) > 1 else list(mode_set)[0]
+        if mode == "replace":
+            return effective_loss
+        if mode == "add":
+            return loss + effective_loss
+        raise ValueError(f"Unknown reg consistency mode: {mode}")
+
+    def _get_bad_state_pool(self) -> BadStatePool:
+        if self.bad_state_pool is None:
+            cfg = self.train_config.bad_state_guard
+            self.bad_state_pool = BadStatePool(
+                path=cfg.path,
+                sd=self.sd,
+                cache_latents=cfg.cache_latents,
+                match_strategy=cfg.match_strategy,
+                resize_mode=cfg.resize_mode,
+            )
+        return self.bad_state_pool
+
+    def _maybe_apply_bad_state_guard_loss(
+        self,
+        *,
+        loss: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        conditional_embeds: PromptEmbeds,
+        match_adapter_assist: bool,
+        network_weight_list: list,
+        timesteps: torch.Tensor,
+        pred_kwargs: dict,
+        batch: DataLoaderBatchDTO,
+        noise: torch.Tensor,
+        unconditional_embeds: Optional[PromptEmbeds],
+        is_reg: bool,
+    ) -> torch.Tensor:
+        cfg = self.train_config.bad_state_guard
+        if not cfg.enabled:
+            return loss
+        if not self.sd.is_flow_matching:
+            raise ValueError("bad_state_guard currently requires a flow-matching model")
+        if cfg.loss_type != "targeted_flow":
+            raise ValueError(
+                f"Unsupported bad_state_guard.loss_type: {cfg.loss_type}. "
+                f"Current supported values: targeted_flow"
+            )
+        if is_reg and not cfg.apply_to_reg:
+            return loss
+        if random.random() >= cfg.probability:
+            return loss
+
+        bad_state_pool = self._get_bad_state_pool()
+        bad_latents = bad_state_pool.get_latents_like(batch.latents, batch)
+        original_unconditional_latents = batch.unconditional_latents
+        batch.unconditional_latents = bad_latents
+        try:
+            guard_loss, guard_details = targeted_flow_guidance(
+                noisy_latents=noisy_latents,
+                conditional_embeds=conditional_embeds,
+                match_adapter_assist=match_adapter_assist,
+                network_weight_list=network_weight_list,
+                timesteps=timesteps,
+                pred_kwargs=pred_kwargs,
+                batch=batch,
+                noise=noise,
+                sd=self.sd,
+                unconditional_embeds=unconditional_embeds,
+                train_config=self.train_config,
+                bad_state_guard_cfg=cfg,
+                current_step=self.step_num,
+                return_details=True,
+            )
+        finally:
+            batch.unconditional_latents = original_unconditional_latents
+
+        effective_guard_loss = guard_loss * cfg.multiplier
+        self.additional_logs["bad_state_guard/repel_triggered"] = guard_details.get("repel_triggered", 0.0)
+        self.additional_logs["bad_state_guard/repel_score"] = guard_details.get("repel_score", 0.0)
+        self.additional_logs["loss/bad_state_guard/repel_raw"] = guard_details.get("repel_raw", 0.0)
+        self.additional_logs["loss/bad_state_guard/repel_effective"] = guard_details.get("repel_effective", 0.0) * cfg.multiplier
+        self.additional_logs["bad_state_guard/repel_scale"] = guard_details.get("repel_scale", 1.0)
+        self.additional_logs["loss/bad_state_guard/raw"] = guard_loss.item()
+        self.additional_logs["loss/bad_state_guard/effective"] = effective_guard_loss.item()
+        self.additional_logs["bad_state_guard/applied"] = 1.0
+        return loss + effective_guard_loss
+
     def before_unet_predict(self):
         pass
 

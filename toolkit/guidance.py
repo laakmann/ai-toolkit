@@ -1,5 +1,5 @@
 import torch
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
 from toolkit.basic import value_map
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -8,7 +8,7 @@ from toolkit.stable_diffusion_model import StableDiffusion
 from toolkit.train_tools import get_torch_dtype
 from toolkit.config_modules import TrainConfig
 
-GuidanceType = Literal["targeted", "polarity", "targeted_polarity", "direct"]
+GuidanceType = Literal["targeted", "polarity", "targeted_polarity", "direct", "tnt", "targeted_flow"]
 
 DIFFERENTIAL_SCALER = 0.2
 
@@ -609,6 +609,170 @@ def get_guided_tnt(
 
     return loss
 
+def compute_targeted_flow_loss(
+    *,
+    target_latents: torch.Tensor,
+    source_latents: torch.Tensor,
+    conditional_embeds: PromptEmbeds,
+    network_weight_list: list,
+    timesteps: torch.Tensor,
+    pred_kwargs: dict,
+    batch: DataLoaderBatchDTO,
+    noise: torch.Tensor,
+    sd: StableDiffusion,
+    unconditional_embeds: Optional[PromptEmbeds] = None,
+    mask_multiplier=None,
+    prior_pred=None,
+    scaler=None,
+    train_config: Optional[TrainConfig] = None,
+    bad_state_guard_cfg=None,
+    current_step: Optional[int] = None,
+    return_details: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
+    if not sd.is_flow_matching:
+        raise ValueError("targeted_flow only works on flow matching models")
+
+    dtype = get_torch_dtype(sd.torch_dtype)
+    device = sd.device_torch
+    with torch.no_grad():
+        dtype = get_torch_dtype(dtype)
+        noise = noise.to(device, dtype=dtype).detach()
+
+        target_latents = target_latents.to(device, dtype=dtype).detach()
+        source_latents = source_latents.to(device, dtype=dtype).detach()
+
+        # get a mask on the differential of the latents
+        # this will be scaled from 0.0-1.0 with 1.0 being the largest differential
+        abs_differential_mask = get_differential_mask(
+            target_latents,
+            source_latents,
+            gradient=True
+        )
+
+        # get noisy latents for both target and source predictions
+        source_noisy_latents = sd.add_noise(
+            source_latents,
+            noise,
+            timesteps
+        ).detach()
+        source_noisy_latents = sd.condition_noisy_latents(source_noisy_latents, batch)
+        target_noisy_latents = sd.add_noise(
+            target_latents,
+            noise,
+            timesteps
+        ).detach()
+        target_noisy_latents = sd.condition_noisy_latents(target_noisy_latents, batch)
+
+        # disable the lora to get a baseline prediction
+        sd.network.is_active = False
+        sd.unet.eval()
+
+        # get a baseline prediction of the model knowledge without the lora network
+        # we do this with the source noisy latents
+        baseline_prediction = sd.predict_noise(
+            latents=source_noisy_latents.to(device, dtype=dtype).detach(),
+            conditional_embeddings=conditional_embeds.to(device, dtype=dtype).detach(),
+            timestep=timesteps,
+            guidance_scale=1.0,
+            **pred_kwargs
+        ).detach()
+
+        # This is our normal flowmatching target
+        # target = noise - latents
+        # we need to target the baseline noise but with our target latents
+        # to do this we first have to determine the baseline_prediction noise by reversing the flowmatching target
+        baseline_predicted_noise = baseline_prediction + source_latents
+
+        # baseline_predicted_noise is now the noise prediction our model would make with the source image.
+        # we use this as our new noise target to preserve the existing knowledge of the image.
+        # we apply a mask to this noise to only allow the differential of the target latents to be learned
+        baseline_predicted_noise = (1 - abs_differential_mask) * baseline_predicted_noise
+        masked_noise = abs_differential_mask * noise
+        target_noise = masked_noise + baseline_predicted_noise
+
+        # compute our new target prediction using our current knowledge noise with our target latents
+        # this makes it so the only new information is the differential of our target and source latents
+        # forcing the network to preserve existing knowledge, but learn only our changes
+        target_pred = (target_noise - target_latents).detach()
+
+    # make a prediction with the lora network active
+    sd.unet.train()
+    sd.network.is_active = True
+    sd.network.multiplier = network_weight_list
+    prediction = sd.predict_noise(
+        latents=target_noisy_latents.to(device, dtype=dtype).detach(),
+        conditional_embeddings=conditional_embeds.to(device, dtype=dtype).detach(),
+        timestep=timesteps,
+        guidance_scale=1.0,
+        **pred_kwargs
+    )
+
+    # target our baseline + differential noise target
+    base_loss = torch.nn.functional.mse_loss(
+        prediction.float(),
+        target_pred.float()
+    )
+    total_loss = base_loss
+
+    details: Dict[str, Any] = {
+        "base_loss": float(base_loss.detach().item()),
+        "repel_triggered": 0.0,
+        "repel_score": 0.0,
+        "repel_raw": 0.0,
+        "repel_effective": 0.0,
+        "repel_scale": 1.0,
+    }
+
+    if bad_state_guard_cfg is not None:
+        guard_mode = getattr(bad_state_guard_cfg, "mode", "standard")
+        if guard_mode == "adaptive_repel":
+            warmup_steps = int(getattr(bad_state_guard_cfg, "warmup_steps", 0) or 0)
+            if current_step is None or current_step >= warmup_steps:
+                predicted_latents = noise - prediction
+                target_latents_detached = target_latents.detach()
+                source_latents_detached = source_latents.detach()
+
+                reduction_dims = tuple(range(1, len(predicted_latents.shape)))
+                d_target = torch.nn.functional.mse_loss(
+                    predicted_latents.float(),
+                    target_latents_detached.float(),
+                    reduction="none",
+                ).mean(dim=reduction_dims)
+                d_source = torch.nn.functional.mse_loss(
+                    predicted_latents.float(),
+                    source_latents_detached.float(),
+                    reduction="none",
+                ).mean(dim=reduction_dims)
+
+                # Positive values mean prediction is closer to source (bad-state) than target.
+                bad_state_score = d_target - d_source
+                trigger_threshold = float(getattr(bad_state_guard_cfg, "trigger_threshold", 0.0) or 0.0)
+                repel_margin = float(getattr(bad_state_guard_cfg, "repel_margin", 0.0) or 0.0)
+                repel_activation = torch.relu(bad_state_score - (trigger_threshold + repel_margin))
+                repel_raw = repel_activation.mean()
+
+                max_repel_scale = float(getattr(bad_state_guard_cfg, "max_repel_scale", 3.0) or 3.0)
+                repel_scale = torch.clamp(
+                    1.0 + repel_activation.detach().mean(),
+                    min=1.0,
+                    max=max_repel_scale,
+                )
+                repel_weight = float(getattr(bad_state_guard_cfg, "repel_weight", 1.0) or 1.0)
+                repel_effective = repel_raw * repel_weight * repel_scale
+                total_loss = base_loss + repel_effective
+
+                details["repel_triggered"] = float((repel_activation.detach() > 0).any().item())
+                details["repel_score"] = float(bad_state_score.detach().mean().item())
+                details["repel_raw"] = float(repel_raw.detach().item())
+                details["repel_effective"] = float(repel_effective.detach().item())
+                details["repel_scale"] = float(repel_scale.detach().item())
+
+    if return_details:
+        details["total_loss"] = float(total_loss.detach().item())
+        return total_loss, details
+
+    return total_loss
+
 def targeted_flow_guidance(
     noisy_latents: torch.Tensor,
     conditional_embeds: 'PromptEmbeds',
@@ -624,92 +788,30 @@ def targeted_flow_guidance(
     prior_pred=None,
     scaler=None,
     train_config=None,
+    bad_state_guard_cfg=None,
+    current_step: Optional[int] = None,
+    return_details: bool = False,
     **kwargs
 ):
-    if not sd.is_flow_matching:
-        raise ValueError("targeted_flow only works on flow matching models")
-    dtype = get_torch_dtype(sd.torch_dtype)
-    device = sd.device_torch
-    with torch.no_grad():
-        dtype = get_torch_dtype(dtype)
-        noise = noise.to(device, dtype=dtype).detach()
-
-        conditional_latents = batch.latents.to(device, dtype=dtype).detach()
-        unconditional_latents = batch.unconditional_latents.to(device, dtype=dtype).detach()
-        
-        # get a mask on the differential of the latents
-        # this will be scaled from 0.0-1.0 with 1.0 being the largest differential
-        abs_differential_mask = get_differential_mask(
-            conditional_latents,
-            unconditional_latents,
-            gradient=True
-        )
-        
-        # get noisy latents for both conditional and unconditional predictions
-        unconditional_noisy_latents = sd.add_noise(
-            unconditional_latents,
-            noise,
-            timesteps
-        ).detach()
-        unconditional_noisy_latents = sd.condition_noisy_latents(unconditional_noisy_latents, batch)
-        conditional_noisy_latents = sd.add_noise(
-            conditional_latents,
-            noise,
-            timesteps
-        ).detach()
-        conditional_noisy_latents = sd.condition_noisy_latents(conditional_noisy_latents, batch)
-        
-        # disable the lora to get a baseline prediction
-        sd.network.is_active = False
-        sd.unet.eval()
-        
-        # get a baseline prediction of the model knowledge without the lora network
-        # we do this with the unconditional noisy latents
-        baseline_prediction = sd.predict_noise(
-            latents=unconditional_noisy_latents.to(device, dtype=dtype).detach(),
-            conditional_embeddings=conditional_embeds.to(device, dtype=dtype).detach(),
-            timestep=timesteps,
-            guidance_scale=1.0,
-            **pred_kwargs
-        ).detach()
-        
-        # This is our normal flowmatching target
-        # target = noise - latents
-        # we need to target the baseline noise but with our conditional latents
-        # to do this we first have to determine the baseline_prediction noise by reversing the flowmatching target
-        baseline_predicted_noise = baseline_prediction + unconditional_latents
-        
-        # baseline_predicted_noise is now the noise prediction our model would make with a the unconditional image.
-        # we use this as our new noise target to preserve the existing knowledge of the image.
-        # we apply a mask to this noise to only allow the differential of the conditional latents to be learned
-        baseline_predicted_noise = (1 - abs_differential_mask) * baseline_predicted_noise
-        masked_noise = abs_differential_mask * noise
-        target_noise = masked_noise + baseline_predicted_noise
-        
-        # compute our new target prediction using our current knowledge noise with our conditional latents
-        # this makes it so the only new information is the differential of our conditional and unconditional latents
-        # forcing the network to preserve existing knowledge, but learn only our changes
-        target_pred = (target_noise - conditional_latents).detach()
-        
-    # make a prediction with the lora network active
-    sd.unet.train()
-    sd.network.is_active = True
-    sd.network.multiplier = network_weight_list
-    prediction = sd.predict_noise(
-        latents=conditional_noisy_latents.to(device, dtype=dtype).detach(),
-        conditional_embeddings=conditional_embeds.to(device, dtype=dtype).detach(),
-        timestep=timesteps,
-        guidance_scale=1.0,
-        **pred_kwargs
+    return compute_targeted_flow_loss(
+        target_latents=batch.latents,
+        source_latents=batch.unconditional_latents,
+        conditional_embeds=conditional_embeds,
+        network_weight_list=network_weight_list,
+        timesteps=timesteps,
+        pred_kwargs=pred_kwargs,
+        batch=batch,
+        noise=noise,
+        sd=sd,
+        unconditional_embeds=unconditional_embeds,
+        mask_multiplier=mask_multiplier,
+        prior_pred=prior_pred,
+        scaler=scaler,
+        train_config=train_config,
+        bad_state_guard_cfg=bad_state_guard_cfg,
+        current_step=current_step,
+        return_details=return_details,
     )
-    
-    # target our baseline + diffirential noise target
-    pred_loss = torch.nn.functional.mse_loss(
-        prediction.float(),
-        target_pred.float()
-    )
-    
-    return pred_loss
 
 
 # this processes all guidance losses based on the batch information
