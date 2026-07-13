@@ -1552,6 +1552,8 @@ class SDTrainer(BaseSDTrainProcess):
             batch.unconditional_latents = original_unconditional_latents
 
         effective_guard_loss = guard_loss * cfg.multiplier
+        self.additional_logs["loss/bad_state_guard/base_raw"] = guard_details.get("base_loss", 0.0)
+        self.additional_logs["loss/bad_state_guard/base_effective"] = guard_details.get("base_effective", 0.0) * cfg.multiplier
         self.additional_logs["bad_state_guard/repel_triggered"] = guard_details.get("repel_triggered", 0.0)
         self.additional_logs["bad_state_guard/repel_score"] = guard_details.get("repel_score", 0.0)
         self.additional_logs["loss/bad_state_guard/repel_raw"] = guard_details.get("repel_raw", 0.0)

@@ -363,6 +363,9 @@ class BadStateGuardConfig:
         self.resize_mode = kwargs.get("resize_mode", "contain")  # contain | cover | stretch
         self.loss_type = kwargs.get("loss_type", "targeted_flow")
         self.mode = kwargs.get("mode", "standard")  # standard | adaptive_repel
+        self.base_weight = kwargs.get("base_weight", 1.0)
+        self.on_trigger_action = kwargs.get("on_trigger_action", "add")  # add | replace_base
+        self.triggered_repel_boost = kwargs.get("triggered_repel_boost", 1.0)
         self.repel_weight = kwargs.get("repel_weight", 1.0)
         self.repel_margin = kwargs.get("repel_margin", 0.0)
         self.trigger_threshold = kwargs.get("trigger_threshold", 0.0)

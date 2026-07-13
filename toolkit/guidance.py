@@ -712,10 +712,16 @@ def compute_targeted_flow_loss(
         prediction.float(),
         target_pred.float()
     )
-    total_loss = base_loss
+    base_weight = 1.0
+    if bad_state_guard_cfg is not None:
+        base_weight = float(getattr(bad_state_guard_cfg, "base_weight", 1.0) or 0.0)
+    base_component = base_loss * base_weight
+    total_loss = base_component
 
     details: Dict[str, Any] = {
         "base_loss": float(base_loss.detach().item()),
+        "base_weight": float(base_weight),
+        "base_effective": float(base_component.detach().item()),
         "repel_triggered": 0.0,
         "repel_score": 0.0,
         "repel_raw": 0.0,
@@ -758,14 +764,23 @@ def compute_targeted_flow_loss(
                     max=max_repel_scale,
                 )
                 repel_weight = float(getattr(bad_state_guard_cfg, "repel_weight", 1.0) or 1.0)
+                triggered_repel_boost = float(getattr(bad_state_guard_cfg, "triggered_repel_boost", 1.0) or 1.0)
                 repel_effective = repel_raw * repel_weight * repel_scale
-                total_loss = base_loss + repel_effective
+                repel_effective_boosted = repel_effective * triggered_repel_boost
+
+                on_trigger_action = getattr(bad_state_guard_cfg, "on_trigger_action", "add")
+                if on_trigger_action == "replace_base" and (repel_activation.detach() > 0).any().item():
+                    total_loss = repel_effective_boosted
+                else:
+                    total_loss = base_component + repel_effective_boosted
 
                 details["repel_triggered"] = float((repel_activation.detach() > 0).any().item())
                 details["repel_score"] = float(bad_state_score.detach().mean().item())
                 details["repel_raw"] = float(repel_raw.detach().item())
-                details["repel_effective"] = float(repel_effective.detach().item())
+                details["repel_effective"] = float(repel_effective_boosted.detach().item())
                 details["repel_scale"] = float(repel_scale.detach().item())
+                details["triggered_repel_boost"] = float(triggered_repel_boost)
+                details["on_trigger_action"] = str(on_trigger_action)
 
     if return_details:
         details["total_loss"] = float(total_loss.detach().item())
