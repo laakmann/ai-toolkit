@@ -86,6 +86,7 @@ function emaWithNulls(ys: (number | null)[], alpha: number): (number | null)[] {
 
 // Trailing moving average over the last N valid samples in the series.
 // Nulls remain null (gaps) and do not consume window capacity.
+// Strict warmup: emit null until N valid samples have been seen.
 function trailingMovingAverageWithNulls(ys: (number | null)[], window: number): (number | null)[] {
   const out: (number | null)[] = new Array(ys.length).fill(null);
   const w = Math.max(1, window | 0);
@@ -106,7 +107,12 @@ function trailingMovingAverageWithNulls(ys: (number | null)[], window: number): 
       sum -= queue.shift() as number;
     }
 
-    out[i] = sum / queue.length;
+    if (queue.length < w) {
+      out[i] = null;
+      continue;
+    }
+
+    out[i] = sum / w;
   }
 
   return out;
@@ -866,7 +872,7 @@ export default function JobLossGraph({ job }: Props) {
             <div className="mt-2 text-[11px] text-gray-500">
               {smoothingMode === 'ema'
                 ? 'EMA is forward/backward (retrospective) with optional trend overlay.'
-                : 'Central tendency uses trailing MA (causal).'}
+                : 'Central tendency uses trailing MA (causal); line starts after full window warmup.'}
             </div>
           </div>
 
