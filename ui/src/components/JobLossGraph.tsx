@@ -194,7 +194,15 @@ function formatLossKeyLabel(key: string): string {
     const datasetSeq = parts[0];
     const metric = parts[parts.length - 1];
     const pathParts = parts.slice(1, -1);
-    const subdir = pathParts.length > 1 ? pathParts.slice(1).join('/') : null;
+    // Keys are shaped like: dN/datasetLabel[/subdir]/metric.
+    // We intentionally show only the final subdirectory token in labels.
+    const rawSubdir = pathParts.length > 1 ? pathParts.slice(1).join('/') : null;
+    const subdir = rawSubdir
+      ? rawSubdir
+        .split('/')
+        .filter(Boolean)
+        .pop() ?? null
+      : null;
 
     let suffix = metric;
     if (metric === 'effective') suffix = 'loss';
