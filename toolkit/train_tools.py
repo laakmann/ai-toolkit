@@ -49,6 +49,53 @@ def get_torch_dtype(dtype_str):
     return dtype_str
 
 
+def compute_reg_consistency_loss(
+    pred: torch.Tensor,
+    prior: torch.Tensor,
+    *,
+    loss_type: str = "mse",
+    tolerance: float = 0.0,
+    smooth_l1_beta: float = 0.01,
+) -> torch.Tensor:
+    loss_type = loss_type.lower()
+
+    if loss_type == "mse":
+        return torch.nn.functional.mse_loss(pred.float(), prior.float())
+
+    if loss_type == "smooth_l1":
+        return torch.nn.functional.smooth_l1_loss(
+            pred.float(),
+            prior.float(),
+            beta=smooth_l1_beta,
+        )
+
+    if loss_type in ["mse_deadzone", "smooth_l1_deadzone"]:
+        if loss_type == "mse_deadzone":
+            per_element = torch.nn.functional.mse_loss(
+                pred.float(),
+                prior.float(),
+                reduction="none",
+            )
+        else:
+            per_element = torch.nn.functional.smooth_l1_loss(
+                pred.float(),
+                prior.float(),
+                reduction="none",
+                beta=smooth_l1_beta,
+            )
+        non_batch_dims = tuple(range(1, per_element.ndim))
+        per_item = per_element.mean(dim=non_batch_dims)
+        return torch.relu(per_item - tolerance).mean()
+
+    if loss_type == "cosine":
+        pred_flat = pred.float().flatten(1)
+        prior_flat = prior.float().flatten(1)
+        similarity = torch.nn.functional.cosine_similarity(pred_flat, prior_flat, dim=1)
+        return (1.0 - similarity).mean()
+
+    raise ValueError(f"Unknown reg consistency loss type: {loss_type}")
+
+
 def replace_filewords_prompt(prompt, args: argparse.Namespace):
     # if name_replace attr in args (may not be)
     if hasattr(args, "name_replace") and args.name_replace is not None:

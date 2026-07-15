@@ -351,6 +351,29 @@ class DecoratorConfig:
         self.num_tokens: str = kwargs.get('num_tokens', 4)
 
 
+class BadStateGuardConfig:
+    def __init__(self, **kwargs):
+        self.enabled = kwargs.get("enabled", False)
+        self.path = kwargs.get("path", None)
+        self.multiplier = kwargs.get("multiplier", 0.002)
+        self.probability = kwargs.get("probability", 0.20)
+        self.apply_to_reg = kwargs.get("apply_to_reg", False)
+        self.match_batch_resolution = kwargs.get("match_batch_resolution", True)
+        self.cache_latents = kwargs.get("cache_latents", True)
+        self.match_strategy = kwargs.get("match_strategy", "nearest_aspect")  # nearest_aspect | random
+        self.resize_mode = kwargs.get("resize_mode", "contain")  # contain | cover | stretch
+        self.loss_type = kwargs.get("loss_type", "targeted_flow")
+        self.mode = kwargs.get("mode", "standard")  # standard | adaptive_repel
+        self.base_weight = kwargs.get("base_weight", 1.0)
+        self.on_trigger_action = kwargs.get("on_trigger_action", "add")  # add | replace_base
+        self.triggered_repel_boost = kwargs.get("triggered_repel_boost", 1.0)
+        self.repel_weight = kwargs.get("repel_weight", 1.0)
+        self.repel_margin = kwargs.get("repel_margin", 0.0)
+        self.trigger_threshold = kwargs.get("trigger_threshold", 0.0)
+        self.max_repel_scale = kwargs.get("max_repel_scale", 3.0)
+        self.warmup_steps = kwargs.get("warmup_steps", 0)
+
+
 ContentOrStyleType = Literal['balanced', 'style', 'content']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
@@ -421,6 +444,15 @@ class TrainConfig:
         self.max_negative_prompts = kwargs.get('max_negative_prompts', 1)
         # multiplier applied to loos on regularization images
         self.reg_weight = kwargs.get('reg_weight', 1.0)
+        self.reg_consistency_loss = kwargs.get("reg_consistency_loss", False)
+        self.reg_consistency_multiplier = kwargs.get("reg_consistency_multiplier", 0.25)
+        self.reg_consistency_mode = kwargs.get("reg_consistency_mode", "replace")  # replace | add
+        self.reg_consistency_loss_type = kwargs.get("reg_consistency_loss_type", "mse")
+        self.reg_consistency_tolerance = kwargs.get("reg_consistency_tolerance", 0.0)
+        self.reg_consistency_smooth_l1_beta = kwargs.get("reg_consistency_smooth_l1_beta", 0.01)
+        self.log_loss_by_dataset = kwargs.get("log_loss_by_dataset", False)
+        self.log_loss_by_dataset_raw = kwargs.get("log_loss_by_dataset_raw", False)
+        self.bad_state_guard = BadStateGuardConfig(**kwargs.get("bad_state_guard", {}))
         self.num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
         # automatically adapte the vae scaling based on the image norm
         self.adaptive_scaling_factor = kwargs.get('adaptive_scaling_factor', False)
@@ -886,6 +918,7 @@ class DatasetConfig:
 
     def __init__(self, **kwargs):
         self.type = kwargs.get('type', 'image')  # sd, slider, reference
+        self.name = kwargs.get("name", None)
         # will be legacy
         self.folder_path: str = kwargs.get('folder_path', None)
         # can be json or folder path
@@ -993,6 +1026,9 @@ class DatasetConfig:
             self.caption_ext = legacy_caption_type
         self.caption_type = self.caption_ext
         self.guidance_type: GuidanceType = kwargs.get('guidance_type', 'targeted')
+        self.timestep_type = kwargs.get("timestep_type", None)
+        self.min_denoising_steps = kwargs.get("min_denoising_steps", None)
+        self.max_denoising_steps = kwargs.get("max_denoising_steps", None)
 
         # ip adapter / reference dataset
         self.clip_image_path: str = kwargs.get('clip_image_path', None)  # depth maps, etc
@@ -1002,6 +1038,11 @@ class DatasetConfig:
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
+        self.reg_consistency_multiplier = kwargs.get("reg_consistency_multiplier", None)
+        self.reg_consistency_mode = kwargs.get("reg_consistency_mode", None)
+        self.reg_consistency_loss_type = kwargs.get("reg_consistency_loss_type", None)
+        self.reg_consistency_tolerance = kwargs.get("reg_consistency_tolerance", None)
+        self.reg_consistency_smooth_l1_beta = kwargs.get("reg_consistency_smooth_l1_beta", None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

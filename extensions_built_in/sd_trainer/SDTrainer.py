@@ -11,12 +11,13 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader, ConcatDataset
 
 from toolkit import train_tools
+from toolkit.bad_state_guard import BadStatePool
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
-from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
+from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType, targeted_flow_guidance
 from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
@@ -25,7 +26,7 @@ from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
-    apply_learnable_snr_gos, LearnableSNRGamma
+    apply_learnable_snr_gos, LearnableSNRGamma, compute_reg_consistency_loss
 import gc
 import torch
 from jobs.process import BaseSDTrainProcess
@@ -83,6 +84,25 @@ class SDTrainer(BaseSDTrainProcess):
         
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
+        self.bad_state_pool: Optional[BadStatePool] = None
+        self._dataset_series_key_by_id = {}
+        self._dataset_sequence_by_series_key = {}
+        self._dataset_label_by_series_key = {}
+        next_dataset_seq = 1
+        for dataset in self.dataset_configs:
+            series_key = self._dataset_series_key(dataset)
+            if series_key not in self._dataset_sequence_by_series_key:
+                self._dataset_sequence_by_series_key[series_key] = next_dataset_seq
+                self._dataset_label_by_series_key[series_key] = self._dataset_label(dataset)
+                next_dataset_seq += 1
+            dataset_seq = self._dataset_sequence_by_series_key[series_key]
+            setattr(dataset, "_aitk_dataset_seq", dataset_seq)
+            setattr(dataset, "_aitk_dataset_series_key", series_key)
+            self._dataset_series_key_by_id[id(dataset)] = series_key
+        self._dataset_sequence_by_id = {
+            id(dataset): self._dataset_sequence_by_series_key[self._dataset_series_key_by_id[id(dataset)]]
+            for dataset in self.dataset_configs
+        }
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -1247,6 +1267,304 @@ class SDTrainer(BaseSDTrainProcess):
                 self.network.is_active = was_network_active
         return prior_pred
 
+    @staticmethod
+    def _sanitize_metric_token(value: str, max_len: int = 28) -> str:
+        text = str(value).strip()
+        if text == "":
+            return "unknown"
+
+        cleaned_chars = []
+        for ch in text:
+            if ch.isalnum() or ch in ["-", "_"]:
+                cleaned_chars.append(ch)
+            else:
+                cleaned_chars.append("-")
+
+        cleaned = "".join(cleaned_chars)
+        while "--" in cleaned:
+            cleaned = cleaned.replace("--", "-")
+        cleaned = cleaned.strip("-_")
+        if cleaned == "":
+            cleaned = "unknown"
+        if len(cleaned) > max_len:
+            cleaned = cleaned[:max_len].rstrip("-_")
+        return cleaned or "unknown"
+
+    def _dataset_series_key(self, dataset_config) -> str:
+        dataset_root = self._dataset_root(dataset_config)
+        if dataset_root is not None:
+            normalized_root = os.path.normcase(os.path.normpath(dataset_root))
+            return f"root:{normalized_root}"
+
+        dataset_name = dataset_config.name
+        if dataset_name is not None and str(dataset_name).strip() != "":
+            return f"name:{self._sanitize_metric_token(dataset_name, max_len=48)}"
+
+        seq = getattr(dataset_config, "_aitk_dataset_seq", None)
+        if isinstance(seq, int) and seq > 0:
+            return f"seq:{seq}"
+
+        return f"id:{id(dataset_config)}"
+
+    def _dataset_series_key_for_config(self, dataset_config) -> str:
+        series_key = getattr(dataset_config, "_aitk_dataset_series_key", None)
+        if isinstance(series_key, str) and series_key != "":
+            return series_key
+
+        series_key = self._dataset_series_key_by_id.get(id(dataset_config))
+        if series_key is not None:
+            return series_key
+
+        return self._dataset_series_key(dataset_config)
+
+    def _dataset_sequence(self, dataset_config) -> int:
+        series_key = self._dataset_series_key_for_config(dataset_config)
+        mapped_seq = self._dataset_sequence_by_series_key.get(series_key)
+        if isinstance(mapped_seq, int) and mapped_seq > 0:
+            return mapped_seq
+
+        seq = getattr(dataset_config, "_aitk_dataset_seq", None)
+        if isinstance(seq, int) and seq > 0:
+            return seq
+        return self._dataset_sequence_by_id.get(id(dataset_config), 0)
+
+    def _dataset_label(self, dataset_config) -> str:
+        dataset_name = dataset_config.name
+        if dataset_name is None:
+            folder_path = dataset_config.folder_path
+            if folder_path is None:
+                folder_path = dataset_config.dataset_path
+            if folder_path is None:
+                folder_path = "unknown"
+            dataset_name = os.path.basename(str(folder_path).rstrip("/"))
+            if dataset_name == "":
+                dataset_name = "unknown"
+        return self._sanitize_metric_token(dataset_name, max_len=20)
+
+    @staticmethod
+    def _dataset_root(dataset_config) -> Optional[str]:
+        root = dataset_config.dataset_path or dataset_config.folder_path
+        if root is None:
+            return None
+        root = str(root)
+        if os.path.isfile(root):
+            root = os.path.dirname(root)
+        return os.path.abspath(root)
+
+    def _dataset_metric_prefix(self, dataset_config) -> str:
+        seq = self._dataset_sequence(dataset_config)
+        series_key = self._dataset_series_key_for_config(dataset_config)
+        dataset_label = self._dataset_label_by_series_key.get(series_key)
+        if dataset_label is None:
+            dataset_label = self._dataset_label(dataset_config)
+        return f"d{seq}/{dataset_label}"
+
+    def _dataset_subdir_label(self, file_item: FileItemDTO) -> str:
+        file_dir = os.path.dirname(str(file_item.path))
+        if file_dir == "":
+            return "root"
+
+        dataset_root = self._dataset_root(file_item.dataset_config)
+        if dataset_root is not None:
+            file_dir_abs = os.path.abspath(file_dir)
+            try:
+                if os.path.commonpath([dataset_root, file_dir_abs]) == dataset_root:
+                    rel = os.path.relpath(file_dir_abs, dataset_root)
+                    if rel in [".", ""]:
+                        return "root"
+                    return self._sanitize_metric_token(os.path.basename(rel), max_len=24)
+            except ValueError:
+                pass
+
+        return self._sanitize_metric_token(os.path.basename(file_dir), max_len=24)
+
+    def _dataset_metric_key(self, file_item: FileItemDTO, include_subdir: bool) -> str:
+        prefix = self._dataset_metric_prefix(file_item.dataset_config)
+        if not include_subdir:
+            return prefix
+        return f"{prefix}/{self._dataset_subdir_label(file_item)}"
+
+    def _log_loss_by_dataset(
+        self,
+        batch: DataLoaderBatchDTO,
+        effective_loss: torch.Tensor,
+        raw_loss: Optional[torch.Tensor] = None,
+    ):
+        if not self.train_config.log_loss_by_dataset:
+            return
+
+        has_raw_loss = (
+            self.train_config.log_loss_by_dataset_raw
+            and raw_loss is not None
+            and torch.isfinite(raw_loss).all().item()
+        )
+
+        logged_dataset_keys = set()
+        for file_item in batch.file_items:
+            dataset_key = self._dataset_metric_key(file_item, include_subdir=True)
+            if dataset_key in logged_dataset_keys:
+                continue
+            logged_dataset_keys.add(dataset_key)
+            self.additional_logs[f"loss_by_dataset/{dataset_key}/effective"] = effective_loss.item()
+            if has_raw_loss:
+                self.additional_logs[f"loss_by_dataset/{dataset_key}/raw"] = raw_loss.item()
+
+    def _resolve_reg_consistency_settings(self, file_item: FileItemDTO):
+        dataset_config = file_item.dataset_config
+        mode = dataset_config.reg_consistency_mode
+        if mode is None:
+            mode = self.train_config.reg_consistency_mode
+        loss_type = dataset_config.reg_consistency_loss_type
+        if loss_type is None:
+            loss_type = self.train_config.reg_consistency_loss_type
+        tolerance = dataset_config.reg_consistency_tolerance
+        if tolerance is None:
+            tolerance = self.train_config.reg_consistency_tolerance
+        smooth_l1_beta = dataset_config.reg_consistency_smooth_l1_beta
+        if smooth_l1_beta is None:
+            smooth_l1_beta = self.train_config.reg_consistency_smooth_l1_beta
+        dataset_reg_consistency_multiplier = dataset_config.reg_consistency_multiplier
+        if dataset_reg_consistency_multiplier is None:
+            dataset_reg_consistency_multiplier = 1.0
+        effective_multiplier = (
+            self.train_config.reg_consistency_multiplier
+            * dataset_reg_consistency_multiplier
+            * dataset_config.loss_multiplier
+        )
+        return mode, loss_type, tolerance, smooth_l1_beta, effective_multiplier
+
+    def _apply_reg_consistency_loss(
+        self,
+        *,
+        loss: torch.Tensor,
+        noise_pred: torch.Tensor,
+        prior_pred: torch.Tensor,
+        batch: DataLoaderBatchDTO,
+    ) -> torch.Tensor:
+        reg_indices = [idx for idx, file_item in enumerate(batch.file_items) if file_item.is_reg]
+        if len(reg_indices) == 0:
+            return loss
+
+        raw_loss_list = []
+        effective_loss_list = []
+        mode_set = set()
+        dataset_effective_loss = {}
+
+        for idx in reg_indices:
+            file_item = batch.file_items[idx]
+            mode, loss_type, tolerance, smooth_l1_beta, effective_multiplier = self._resolve_reg_consistency_settings(file_item)
+            mode_set.add(mode)
+            raw_loss = compute_reg_consistency_loss(
+                noise_pred[idx:idx + 1],
+                prior_pred[idx:idx + 1],
+                loss_type=loss_type,
+                tolerance=tolerance,
+                smooth_l1_beta=smooth_l1_beta,
+            )
+            effective_loss = raw_loss * effective_multiplier
+
+            raw_loss_list.append(raw_loss)
+            effective_loss_list.append(effective_loss)
+
+            dataset_key = self._dataset_metric_key(file_item, include_subdir=False)
+            if dataset_key not in dataset_effective_loss:
+                dataset_effective_loss[dataset_key] = []
+            dataset_effective_loss[dataset_key].append(effective_loss)
+
+        raw_loss = torch.stack(raw_loss_list).mean()
+        effective_loss = torch.stack(effective_loss_list).mean()
+
+        self.additional_logs["loss/reg_consistency/raw"] = raw_loss.item()
+        self.additional_logs["loss/reg_consistency/effective"] = effective_loss.item()
+        for dataset_key, dataset_losses in dataset_effective_loss.items():
+            self.additional_logs[f"loss_by_dataset/{dataset_key}/reg_consistency_effective"] = torch.stack(dataset_losses).mean().item()
+
+        mode = "add" if len(mode_set) > 1 else list(mode_set)[0]
+        if mode == "replace":
+            return effective_loss
+        if mode == "add":
+            return loss + effective_loss
+        raise ValueError(f"Unknown reg consistency mode: {mode}")
+
+    def _get_bad_state_pool(self) -> BadStatePool:
+        if self.bad_state_pool is None:
+            cfg = self.train_config.bad_state_guard
+            self.bad_state_pool = BadStatePool(
+                path=cfg.path,
+                sd=self.sd,
+                cache_latents=cfg.cache_latents,
+                match_strategy=cfg.match_strategy,
+                resize_mode=cfg.resize_mode,
+            )
+        return self.bad_state_pool
+
+    def _maybe_apply_bad_state_guard_loss(
+        self,
+        *,
+        loss: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        conditional_embeds: PromptEmbeds,
+        match_adapter_assist: bool,
+        network_weight_list: list,
+        timesteps: torch.Tensor,
+        pred_kwargs: dict,
+        batch: DataLoaderBatchDTO,
+        noise: torch.Tensor,
+        unconditional_embeds: Optional[PromptEmbeds],
+        is_reg: bool,
+    ) -> torch.Tensor:
+        cfg = self.train_config.bad_state_guard
+        if not cfg.enabled:
+            return loss
+        if not self.sd.is_flow_matching:
+            raise ValueError("bad_state_guard currently requires a flow-matching model")
+        if cfg.loss_type != "targeted_flow":
+            raise ValueError(
+                f"Unsupported bad_state_guard.loss_type: {cfg.loss_type}. "
+                f"Current supported values: targeted_flow"
+            )
+        if is_reg and not cfg.apply_to_reg:
+            return loss
+        if random.random() >= cfg.probability:
+            return loss
+
+        bad_state_pool = self._get_bad_state_pool()
+        bad_latents = bad_state_pool.get_latents_like(batch.latents, batch)
+        original_unconditional_latents = batch.unconditional_latents
+        batch.unconditional_latents = bad_latents
+        try:
+            guard_loss, guard_details = targeted_flow_guidance(
+                noisy_latents=noisy_latents,
+                conditional_embeds=conditional_embeds,
+                match_adapter_assist=match_adapter_assist,
+                network_weight_list=network_weight_list,
+                timesteps=timesteps,
+                pred_kwargs=pred_kwargs,
+                batch=batch,
+                noise=noise,
+                sd=self.sd,
+                unconditional_embeds=unconditional_embeds,
+                train_config=self.train_config,
+                bad_state_guard_cfg=cfg,
+                current_step=self.step_num,
+                return_details=True,
+            )
+        finally:
+            batch.unconditional_latents = original_unconditional_latents
+
+        effective_guard_loss = guard_loss * cfg.multiplier
+        self.additional_logs["loss/bad_state_guard/base_raw"] = guard_details.get("base_loss", 0.0)
+        self.additional_logs["loss/bad_state_guard/base_effective"] = guard_details.get("base_effective", 0.0) * cfg.multiplier
+        self.additional_logs["bad_state_guard/repel_triggered"] = guard_details.get("repel_triggered", 0.0)
+        self.additional_logs["bad_state_guard/repel_score"] = guard_details.get("repel_score", 0.0)
+        self.additional_logs["loss/bad_state_guard/repel_raw"] = guard_details.get("repel_raw", 0.0)
+        self.additional_logs["loss/bad_state_guard/repel_effective"] = guard_details.get("repel_effective", 0.0) * cfg.multiplier
+        self.additional_logs["bad_state_guard/repel_scale"] = guard_details.get("repel_scale", 1.0)
+        self.additional_logs["loss/bad_state_guard/raw"] = guard_loss.item()
+        self.additional_logs["loss/bad_state_guard/effective"] = effective_guard_loss.item()
+        self.additional_logs["bad_state_guard/applied"] = 1.0
+        return loss + effective_guard_loss
+
     def before_unet_predict(self):
         pass
 
@@ -1331,8 +1649,9 @@ class SDTrainer(BaseSDTrainProcess):
             has_adapter_img = batch.control_tensor is not None
             has_clip_image = batch.clip_image_tensor is not None
             has_clip_image_embeds = batch.clip_image_embeds is not None
+            has_reg_items = any([batch.file_items[idx].is_reg for idx in range(len(batch.file_items))])
             # force it to be true if doing regs as we handle those differently
-            if any([batch.file_items[idx].is_reg for idx in range(len(batch.file_items))]):
+            if has_reg_items:
                 has_clip_image = True
                 if self._clip_image_embeds_unconditional is not None:
                     has_clip_image_embeds = True  # we are caching embeds, handle that differently
@@ -1342,6 +1661,7 @@ class SDTrainer(BaseSDTrainProcess):
             do_reg_prior = False
             if any([batch.file_items[idx].prior_reg for idx in range(len(batch.file_items))]):
                 do_reg_prior = True
+            do_reg_consistency = self.train_config.reg_consistency_loss and has_reg_items
 
             if self.adapter is not None and isinstance(self.adapter, IPAdapter) and not has_clip_image and has_adapter_img:
                 raise ValueError(
@@ -1861,7 +2181,7 @@ class SDTrainer(BaseSDTrainProcess):
                         do_guidance_prior = True
 
                 if ((
-                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or self.do_prior_prediction or do_guidance_prior or do_reg_prior or do_inverted_masked_prior or self.train_config.correct_pred_norm):
+                        has_adapter_img and self.assistant_adapter and match_adapter_assist) or self.do_prior_prediction or do_guidance_prior or do_reg_prior or do_reg_consistency or do_inverted_masked_prior or self.train_config.correct_pred_norm):
                     with self.timer('prior predict'):
                         prior_embeds_to_use = conditional_embeds
                         # use diff_output_preservation embeds if doing dfe
@@ -1966,7 +2286,8 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.adapter and isinstance(self.adapter, CustomAdapter):
                         noisy_latents = self.adapter.condition_noisy_latents(noisy_latents, batch)
                 
-                if self.train_config.timestep_type == 'next_sample':
+                effective_timestep_type = getattr(batch, "effective_timestep_type", self.train_config.timestep_type)
+                if effective_timestep_type == 'next_sample':
                     with self.timer('next_sample_step'):
                         with torch.no_grad():
                             
@@ -2090,7 +2411,31 @@ class SDTrainer(BaseSDTrainProcess):
                         self.additional_logs['loss/preservation'] = preservation_loss.item()
                         loss = loss + preservation_loss
 
+                    if do_reg_consistency and prior_pred is not None:
+                        loss = self._apply_reg_consistency_loss(
+                            loss=loss,
+                            noise_pred=noise_pred,
+                            prior_pred=prior_pred,
+                            batch=batch,
+                        )
+
+                loss_before_bad_state_guard = loss.detach()
+                loss = self._maybe_apply_bad_state_guard_loss(
+                    loss=loss,
+                    noisy_latents=noisy_latents,
+                    conditional_embeds=conditional_embeds,
+                    match_adapter_assist=match_adapter_assist,
+                    network_weight_list=network_weight_list,
+                    timesteps=timesteps,
+                    pred_kwargs=pred_kwargs,
+                    batch=batch,
+                    noise=noise,
+                    unconditional_embeds=unconditional_embeds,
+                    is_reg=is_reg,
+                )
+
                 # check if nan
+                raw_loss_for_dataset = loss_before_bad_state_guard
                 if torch.isnan(loss):
                     print_acc("loss is nan")
                     loss = torch.zeros_like(loss).requires_grad_(True)
@@ -2098,6 +2443,11 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('backward'):
                     # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
                     loss = loss * loss_multiplier.mean()
+                    self._log_loss_by_dataset(
+                        batch=batch,
+                        effective_loss=loss.detach(),
+                        raw_loss=raw_loss_for_dataset,
+                    )
                     # IMPORTANT if gradient checkpointing do not leave with network when doing backward
                     # it will destroy the gradients. This is because the network is a context manager
                     # and will change the multipliers back to 0.0 when exiting. They will be
