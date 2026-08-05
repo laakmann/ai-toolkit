@@ -156,95 +156,15 @@ export default function SampleImages({ job }: SampleImagesProps) {
     );
   }, [status, sampleImages.length]);
 
-  // Use direct Tailwind class without string interpolation
-  // This way Tailwind can properly generate the class
-  // I hate this, but it's the only way to make it work
-  const gridColsClass = useMemo(() => {
-    const cols = Math.min(numSamples, 40);
-
-    switch (cols) {
-      case 1:
-      case 2:
-      case 3:
-        return 'grid-cols-3';
-      case 4:
-        return 'grid-cols-4';
-      case 5:
-        return 'grid-cols-5';
-      case 6:
-        return 'grid-cols-6';
-      case 7:
-        return 'grid-cols-7';
-      case 8:
-        return 'grid-cols-8';
-      case 9:
-        return 'grid-cols-9';
-      case 10:
-        return 'grid-cols-10';
-      case 11:
-        return 'grid-cols-11';
-      case 12:
-        return 'grid-cols-12';
-      case 13:
-        return 'grid-cols-13';
-      case 14:
-        return 'grid-cols-14';
-      case 15:
-        return 'grid-cols-15';
-      case 16:
-        return 'grid-cols-16';
-      case 17:
-        return 'grid-cols-17';
-      case 18:
-        return 'grid-cols-18';
-      case 19:
-        return 'grid-cols-19';
-      case 20:
-        return 'grid-cols-20';
-      case 21:
-        return 'grid-cols-21';
-      case 22:
-        return 'grid-cols-22';
-      case 23:
-        return 'grid-cols-23';
-      case 24:
-        return 'grid-cols-24';
-      case 25:
-        return 'grid-cols-25';
-      case 26:
-        return 'grid-cols-26';
-      case 27:
-        return 'grid-cols-27';
-      case 28:
-        return 'grid-cols-28';
-      case 29:
-        return 'grid-cols-29';
-      case 30:
-        return 'grid-cols-30';
-      case 31:
-        return 'grid-cols-31';
-      case 32:
-        return 'grid-cols-32';
-      case 33:
-        return 'grid-cols-33';
-      case 34:
-        return 'grid-cols-34';
-      case 35:
-        return 'grid-cols-35';
-      case 36:
-        return 'grid-cols-36';
-      case 37:
-        return 'grid-cols-37';
-      case 38:
-        return 'grid-cols-38';
-      case 39:
-        return 'grid-cols-39';
-      case 40:
-        return 'grid-cols-40';
-      default:
-        return 'grid-cols-3';
-    }
-  }, [numSamples]);
+  const visibleColumns = useMemo(() => Math.max(numSamples, 3), [numSamples]);
+  const useHorizontalSampleScroll = useMemo(() => numSamples > 8, [numSamples]);
+  const gridTemplateColumns = useMemo(
+    () =>
+      useHorizontalSampleScroll
+        ? `repeat(${visibleColumns}, minmax(104px, 1fr))`
+        : `repeat(${visibleColumns}, minmax(0, 1fr))`,
+    [visibleColumns, useHorizontalSampleScroll],
+  );
 
   const sampleConfig = useMemo(() => {
     if (job?.job_config) {
@@ -271,28 +191,26 @@ export default function SampleImages({ job }: SampleImagesProps) {
               const row = rows[index];
               if (!row) return null;
 
-              // Only pad the final row when numSamples < MIN_COLS and the row is short.
-              const MIN_COLS = 3;
-              const shouldPad = numSamples < MIN_COLS && row.length < MIN_COLS;
-              const padsNeeded = shouldPad ? MIN_COLS - row.length : 0;
+              const padsNeeded = row.length < visibleColumns ? visibleColumns - row.length : 0;
 
               return (
-                // pb-1 recreates the vertical gap between rows that the original single CSS grid provided via `gap-1`.
-                <div className={`grid ${gridColsClass} gap-1 pb-1`}>
-                  {row.map(sample => (
-                    <SampleImageCard
-                      key={sample}
-                      imageUrl={sample}
-                      numSamples={numSamples}
-                      sampleImages={sampleImages}
-                      alt="Sample Image"
-                      onClick={() => setSelectedSamplePath(sample)}
-                      observerRoot={scrollParent}
-                    />
-                  ))}
-                  {Array.from({ length: padsNeeded }).map((_, i) => (
-                    <div key={`pad-${index}-${i}`} className="invisible" />
-                  ))}
+                <div className={classNames('pb-1', { 'overflow-x-auto': useHorizontalSampleScroll })}>
+                  <div className="grid gap-1" style={{ gridTemplateColumns }}>
+                    {row.map(sample => (
+                      <SampleImageCard
+                        key={sample}
+                        imageUrl={sample}
+                        numSamples={numSamples}
+                        sampleImages={sampleImages}
+                        alt="Sample Image"
+                        onClick={() => setSelectedSamplePath(sample)}
+                        observerRoot={scrollParent}
+                      />
+                    ))}
+                    {Array.from({ length: padsNeeded }).map((_, i) => (
+                      <div key={`pad-${index}-${i}`} className="invisible" />
+                    ))}
+                  </div>
                 </div>
               );
             }}
