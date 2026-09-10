@@ -197,6 +197,16 @@ class SDTrainer(BaseSDTrainProcess):
             self.additional_logs['weight_noise_norm'] = float(noise_sq ** 0.5)
             self.additional_logs['weight_norm'] = float(weight_sq ** 0.5)
 
+    def _decode_latents_for_pixel_loss(self, latents: torch.Tensor) -> torch.Tensor:
+        if getattr(self.sd, 'arch', None) == 'ideogram4':
+            return self.sd.decode_latents(
+                latents,
+                device=self.device_torch,
+                dtype=get_torch_dtype(self.train_config.dtype),
+            )
+        output = latents / self.sd.vae.config['scaling_factor']
+        return self.sd.vae.decode(output).sample
+
     def get_blank_control_image(self):
         # noise instead of a black image so the fallback does not read as a
         # meaningful (solid black) reference
@@ -583,8 +593,7 @@ class SDTrainer(BaseSDTrainProcess):
             device=self.device_torch
         )
 
-        output = denoised_latents / self.sd.vae.config['scaling_factor']
-        output = self.sd.vae.decode(output).sample
+        output = self._decode_latents_for_pixel_loss(denoised_latents)
 
         if self.train_config.show_turbo_outputs:
             # since we are completely denoising, we can show them here
