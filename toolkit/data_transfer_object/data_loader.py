@@ -240,6 +240,7 @@ class DataLoaderBatchDTO:
             is_latents_cached = self.file_items[0].is_latent_cached
             self.tensor: Union[torch.Tensor, None] = None
             self.latents: Union[torch.Tensor, None] = None
+            self.body_proportion_embedding: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
@@ -388,6 +389,17 @@ class DataLoaderBatchDTO:
             self.latent_perceptual_loss_max_t_list = [x.latent_perceptual_loss_max_t for x in self.file_items]
             self.perceptual_restrict_to_body_list = [x.perceptual_restrict_to_body for x in self.file_items]
             self.loss_split_list = [x.loss_split for x in self.file_items]
+
+            if any([getattr(x, 'body_proportion_embedding', None) is not None for x in self.file_items]):
+                base_bp = next(getattr(x, 'body_proportion_embedding', None) for x in self.file_items if getattr(x, 'body_proportion_embedding', None) is not None)
+                bp_items = []
+                for x in self.file_items:
+                    bp = getattr(x, 'body_proportion_embedding', None)
+                    if bp is None:
+                        bp_items.append(torch.zeros_like(base_bp))
+                    else:
+                        bp_items.append(bp)
+                self.body_proportion_embedding = torch.stack(bp_items, dim=0)
 
             if any([getattr(x, 'subject_mask', None) is not None for x in self.file_items]):
                 base_subject_mask = next(getattr(x, 'subject_mask', None) for x in self.file_items if getattr(x, 'subject_mask', None) is not None)
