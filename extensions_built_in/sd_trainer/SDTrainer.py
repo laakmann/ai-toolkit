@@ -30,7 +30,8 @@ from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.depth_consistency import cache_depth_gt_embeddings, DifferentiableDepthEncoder, compute_depth_consistency_loss
 from toolkit.face_id import cache_face_embeddings
 from toolkit.subject_mask import cache_subject_masks
-from toolkit.vae_anchor import cache_vae_anchor_features
+from toolkit.face_id import DifferentiableFaceEncoder
+from toolkit.vae_anchor import cache_vae_anchor_features, VAEAnchorEncoder
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
     apply_learnable_snr_gos, LearnableSNRGamma, compute_reg_consistency_loss
 import gc
@@ -106,6 +107,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.unconditional_embeds = None
         self.bad_state_pool: Optional[BadStatePool] = None
         self.depth_encoder: Optional[DifferentiableDepthEncoder] = None
+        self.identity_encoder: Optional[DifferentiableFaceEncoder] = None
+        self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
         self._dataset_series_key_by_id = {}
         self._dataset_sequence_by_series_key = {}
         self._dataset_label_by_series_key = {}
@@ -368,6 +371,203 @@ class SDTrainer(BaseSDTrainProcess):
         depth_loss = total_loss / float(used)
         self.additional_logs['loss/depth_consistency'] = float(depth_loss.item())
         return depth_loss
+
+    def _compute_identity_aux_loss(
+        self,
+        noise_pred: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: 'DataLoaderBatchDTO',
+    ) -> torch.Tensor:
+        cfg = self.face_id_config
+        if cfg is None:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if cfg.identity_loss_weight <= 0 and not cfg.identity_metrics:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if getattr(batch, 'file_items', None) is None or len(batch.file_items) == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if len(noise_pred.shape) != 4:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.identity_encoder is None and (cfg.identity_loss_weight > 0 or cfg.identity_metrics):
+            self.identity_encoder = DifferentiableFaceEncoder(model_name=cfg.face_model)
+            self.identity_encoder.to(self.device_torch)
+            self.identity_encoder.eval()
+
+        if self.sd.x0_pred:
+            x0_pred = noise_pred
+        else:
+            tv = timesteps.to(noise_pred.device).to(noise_pred.dtype) / 1000.0
+            while len(tv.shape) < len(noise_pred.shape):
+                tv = tv.unsqueeze(-1)
+            tv = torch.clamp(tv, min=0.001)
+            x0_pred = noisy_latents - tv * noise_pred
+
+        total_steps = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        total_loss = torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        used = 0
+        cos_terms: List[torch.Tensor] = []
+
+        for i, file_item in enumerate(batch.file_items):
+            ref_embed = getattr(file_item, 'identity_embedding', None)
+            if ref_embed is None:
+                continue
+            ref_embed = ref_embed.to(self.device_torch, dtype=torch.float32)
+            if ref_embed.dim() == 1:
+                ref_embed = ref_embed.unsqueeze(0)
+            ref_embed = torch.nn.functional.normalize(ref_embed, p=2, dim=-1)
+
+            min_t = cfg.identity_loss_min_t
+            max_t = cfg.identity_loss_max_t
+            if hasattr(batch, 'identity_loss_min_t_list') and i < len(batch.identity_loss_min_t_list):
+                ds_min_t = batch.identity_loss_min_t_list[i]
+                if ds_min_t is not None:
+                    min_t = float(ds_min_t)
+            if hasattr(batch, 'identity_loss_max_t_list') and i < len(batch.identity_loss_max_t_list):
+                ds_max_t = batch.identity_loss_max_t_list[i]
+                if ds_max_t is not None:
+                    max_t = float(ds_max_t)
+
+            t_ratio = float(timesteps[i].detach().float().item() / total_steps)
+            if t_ratio < min_t or t_ratio > max_t:
+                continue
+
+            x0_i = x0_pred[i:i + 1]
+            x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
+            x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+
+            if self.identity_encoder is not None:
+                pred_embed = self.identity_encoder(x0_pixels).to(torch.float32)
+                pred_embed = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
+                cos_sim = torch.nn.functional.cosine_similarity(pred_embed, ref_embed, dim=-1).mean()
+            else:
+                cos_sim = torch.tensor(0.0, device=self.device_torch, dtype=torch.float32)
+            cos_terms.append(cos_sim.detach())
+
+            w = cfg.identity_loss_weight
+            if hasattr(batch, 'identity_loss_weight_list') and i < len(batch.identity_loss_weight_list):
+                ds_w = batch.identity_loss_weight_list[i]
+                if ds_w is not None:
+                    w = float(ds_w)
+
+            min_cos = cfg.identity_loss_min_cos
+            if hasattr(batch, 'identity_loss_min_cos_list') and i < len(batch.identity_loss_min_cos_list):
+                ds_min_cos = batch.identity_loss_min_cos_list[i]
+                if ds_min_cos is not None:
+                    min_cos = float(ds_min_cos)
+
+            if cfg.identity_metrics and w <= 0:
+                continue
+            if w <= 0:
+                continue
+            if cos_sim.item() < min_cos:
+                continue
+
+            loss_i = (1.0 - cos_sim) * w
+            total_loss = total_loss + loss_i
+            used += 1
+
+        if cos_terms:
+            stacked = torch.stack(cos_terms)
+            self.additional_logs['loss/id_sim'] = float(stacked.mean().item())
+
+        if used == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        id_loss = total_loss / float(used)
+        self.additional_logs['loss/identity'] = float(id_loss.item())
+        return id_loss
+
+    def _compute_vae_anchor_aux_loss(
+        self,
+        noise_pred: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: 'DataLoaderBatchDTO',
+    ) -> torch.Tensor:
+        cfg = self.face_id_config
+        if cfg is None or cfg.vae_anchor_loss_weight <= 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if getattr(batch, 'file_items', None) is None or len(batch.file_items) == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if len(noise_pred.shape) != 4:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.vae_anchor_encoder is None:
+            self.vae_anchor_encoder = VAEAnchorEncoder(vae_path=cfg.vae_anchor_model_path)
+            self.vae_anchor_encoder.load(
+                device=self.device_torch,
+                dtype=get_torch_dtype(self.train_config.dtype),
+            )
+
+        if self.sd.x0_pred:
+            x0_pred = noise_pred
+        else:
+            tv = timesteps.to(noise_pred.device).to(noise_pred.dtype) / 1000.0
+            while len(tv.shape) < len(noise_pred.shape):
+                tv = tv.unsqueeze(-1)
+            tv = torch.clamp(tv, min=0.001)
+            x0_pred = noisy_latents - tv * noise_pred
+
+        total_steps = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        total_loss = torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        used = 0
+
+        for i, file_item in enumerate(batch.file_items):
+            ref_features = getattr(file_item, 'vae_anchor_features', None)
+            if not ref_features:
+                continue
+
+            w = cfg.vae_anchor_loss_weight
+            if hasattr(batch, 'vae_anchor_loss_weight_list') and i < len(batch.vae_anchor_loss_weight_list):
+                ds_w = batch.vae_anchor_loss_weight_list[i]
+                if ds_w is not None:
+                    w = float(ds_w)
+            if w <= 0:
+                continue
+
+            min_t = cfg.vae_anchor_loss_min_t
+            max_t = cfg.vae_anchor_loss_max_t
+            if hasattr(batch, 'vae_anchor_loss_min_t_list') and i < len(batch.vae_anchor_loss_min_t_list):
+                ds_min_t = batch.vae_anchor_loss_min_t_list[i]
+                if ds_min_t is not None:
+                    min_t = float(ds_min_t)
+            if hasattr(batch, 'vae_anchor_loss_max_t_list') and i < len(batch.vae_anchor_loss_max_t_list):
+                ds_max_t = batch.vae_anchor_loss_max_t_list[i]
+                if ds_max_t is not None:
+                    max_t = float(ds_max_t)
+
+            t_ratio = float(timesteps[i].detach().float().item() / total_steps)
+            if t_ratio < min_t or t_ratio > max_t:
+                continue
+
+            x0_i = x0_pred[i:i + 1]
+            x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
+            x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+            x0_m1 = x0_pixels * 2.0 - 1.0
+
+            _, pred_features = self.vae_anchor_encoder.encode_with_features(x0_m1)
+            ref_features_device = {
+                k: v.to(self.device_torch, dtype=pred_features[k].dtype)
+                for k, v in ref_features.items()
+                if k in pred_features
+            }
+            if not ref_features_device:
+                continue
+
+            loss_i, per_level = self.vae_anchor_encoder.compute_loss(
+                pred_features,
+                ref_features_device,
+            )
+            total_loss = total_loss + (loss_i * w)
+            used += 1
+            for level_name, level_val in per_level.items():
+                self.additional_logs[f'loss/vae_anchor/{level_name}'] = float(level_val)
+
+        if used == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        anchor_loss = total_loss / float(used)
+        self.additional_logs['loss/vae_anchor'] = float(anchor_loss.item())
+        return anchor_loss
 
     def get_blank_control_image(self):
         # noise instead of a black image so the fallback does not read as a
@@ -1324,6 +1524,10 @@ class SDTrainer(BaseSDTrainProcess):
 
         depth_aux_loss = self._compute_depth_aux_loss(noise_pred, noisy_latents, timesteps, batch)
         loss = loss + depth_aux_loss
+        identity_aux_loss = self._compute_identity_aux_loss(noise_pred, noisy_latents, timesteps, batch)
+        loss = loss + identity_aux_loss
+        vae_anchor_aux_loss = self._compute_vae_anchor_aux_loss(noise_pred, noisy_latents, timesteps, batch)
+        loss = loss + vae_anchor_aux_loss
         
         if hasattr(self.sd, "get_additional_loss"):
             additional_model_loss = self.sd.get_additional_loss(pred, target)
