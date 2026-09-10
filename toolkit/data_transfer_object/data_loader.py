@@ -200,6 +200,12 @@ class FileItemDTO(
         self.body_proportion_loss_weight = getattr(self.dataset_config, 'body_proportion_loss_weight', None)
         self.body_proportion_loss_min_t = getattr(self.dataset_config, 'body_proportion_loss_min_t', None)
         self.body_proportion_loss_max_t = getattr(self.dataset_config, 'body_proportion_loss_max_t', None)
+        self.body_shape_loss_weight = getattr(self.dataset_config, 'body_shape_loss_weight', None)
+        self.body_shape_loss_min_t = getattr(self.dataset_config, 'body_shape_loss_min_t', None)
+        self.body_shape_loss_max_t = getattr(self.dataset_config, 'body_shape_loss_max_t', None)
+        self.normal_loss_weight = getattr(self.dataset_config, 'normal_loss_weight', None)
+        self.normal_loss_min_t = getattr(self.dataset_config, 'normal_loss_min_t', None)
+        self.normal_loss_max_t = getattr(self.dataset_config, 'normal_loss_max_t', None)
         self.vae_anchor_loss_weight = getattr(self.dataset_config, 'vae_anchor_loss_weight', None)
         self.vae_anchor_loss_min_t = getattr(self.dataset_config, 'vae_anchor_loss_min_t', None)
         self.vae_anchor_loss_max_t = getattr(self.dataset_config, 'vae_anchor_loss_max_t', None)
@@ -242,7 +248,10 @@ class DataLoaderBatchDTO:
             self.latents: Union[torch.Tensor, None] = None
             self.body_proportion_embedding: Union[torch.Tensor, None] = None
             self.landmark_embedding: Union[torch.Tensor, None] = None
+            self.body_shape_embedding: Union[torch.Tensor, None] = None
+            self.normal_embedding: Union[torch.Tensor, None] = None
             self.face_bboxes: Union[List, None] = None
+            self.person_bboxes: Union[List, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
@@ -380,6 +389,12 @@ class DataLoaderBatchDTO:
             self.body_proportion_loss_weight_list = [x.body_proportion_loss_weight for x in self.file_items]
             self.body_proportion_loss_min_t_list = [x.body_proportion_loss_min_t for x in self.file_items]
             self.body_proportion_loss_max_t_list = [x.body_proportion_loss_max_t for x in self.file_items]
+            self.body_shape_loss_weight_list = [x.body_shape_loss_weight for x in self.file_items]
+            self.body_shape_loss_min_t_list = [x.body_shape_loss_min_t for x in self.file_items]
+            self.body_shape_loss_max_t_list = [x.body_shape_loss_max_t for x in self.file_items]
+            self.normal_loss_weight_list = [x.normal_loss_weight for x in self.file_items]
+            self.normal_loss_min_t_list = [x.normal_loss_min_t for x in self.file_items]
+            self.normal_loss_max_t_list = [x.normal_loss_max_t for x in self.file_items]
             self.vae_anchor_loss_weight_list = [x.vae_anchor_loss_weight for x in self.file_items]
             self.vae_anchor_loss_min_t_list = [x.vae_anchor_loss_min_t for x in self.file_items]
             self.vae_anchor_loss_max_t_list = [x.vae_anchor_loss_max_t for x in self.file_items]
@@ -414,8 +429,33 @@ class DataLoaderBatchDTO:
                         lm_items.append(lm)
                 self.landmark_embedding = torch.stack(lm_items, dim=0)
 
+            if any([getattr(x, 'body_shape_embedding', None) is not None for x in self.file_items]):
+                base_bs = next(getattr(x, 'body_shape_embedding', None) for x in self.file_items if getattr(x, 'body_shape_embedding', None) is not None)
+                bs_items = []
+                for x in self.file_items:
+                    bs = getattr(x, 'body_shape_embedding', None)
+                    if bs is None:
+                        bs_items.append(torch.zeros_like(base_bs))
+                    else:
+                        bs_items.append(bs)
+                self.body_shape_embedding = torch.stack(bs_items, dim=0)
+
+            if any([getattr(x, 'normal_embedding', None) is not None for x in self.file_items]):
+                base_norm = next(getattr(x, 'normal_embedding', None) for x in self.file_items if getattr(x, 'normal_embedding', None) is not None)
+                norm_items = []
+                for x in self.file_items:
+                    ne = getattr(x, 'normal_embedding', None)
+                    if ne is None:
+                        norm_items.append(torch.zeros_like(base_norm))
+                    else:
+                        norm_items.append(ne)
+                self.normal_embedding = torch.stack(norm_items, dim=0)
+
             if any([getattr(x, 'face_bbox', None) is not None for x in self.file_items]):
                 self.face_bboxes = [getattr(x, 'face_bbox', None) for x in self.file_items]
+
+            if any([getattr(x, 'person_bbox', None) is not None for x in self.file_items]):
+                self.person_bboxes = [getattr(x, 'person_bbox', None) for x in self.file_items]
 
             if any([getattr(x, 'subject_mask', None) is not None for x in self.file_items]):
                 base_subject_mask = next(getattr(x, 'subject_mask', None) for x in self.file_items if getattr(x, 'subject_mask', None) is not None)

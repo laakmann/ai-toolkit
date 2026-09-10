@@ -29,9 +29,11 @@ from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.depth_consistency import cache_depth_gt_embeddings, DifferentiableDepthEncoder, compute_depth_consistency_loss
 from toolkit.body_id import cache_body_proportion_embeddings, DifferentiableBodyProportionEncoder
+from toolkit.body_shape import cache_body_shape_embeddings, DifferentiableBodyShapeEncoder
 from toolkit.face_id import cache_face_embeddings
 from toolkit.subject_mask import cache_subject_masks
 from toolkit.face_id import DifferentiableFaceEncoder, DifferentiableLandmarkEncoder
+from toolkit.normal_id import cache_normal_embeddings, DifferentiableNormalEncoder
 from toolkit.vae_anchor import cache_vae_anchor_features, VAEAnchorEncoder
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
     apply_learnable_snr_gos, LearnableSNRGamma, compute_reg_consistency_loss
@@ -113,6 +115,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.landmark_loss_model: Optional[DifferentiableLandmarkEncoder] = None
         self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
         self.body_proportion_model: Optional[DifferentiableBodyProportionEncoder] = None
+        self.body_shape_model: Optional[DifferentiableBodyShapeEncoder] = None
+        self.normal_loss_model: Optional[DifferentiableNormalEncoder] = None
         self.latent_perceptual_model = None
         self._latent_perceptual_import_failed = False
         self._dataset_series_key_by_id = {}
@@ -258,6 +262,14 @@ class SDTrainer(BaseSDTrainProcess):
             if face_cfg.body_proportion_loss_weight > 0:
                 for _ds, file_list in self._iter_dataset_file_lists():
                     cache_body_proportion_embeddings(file_list, face_cfg)
+
+            if face_cfg.body_shape_loss_weight > 0:
+                for _ds, file_list in self._iter_dataset_file_lists():
+                    cache_body_shape_embeddings(file_list, face_cfg)
+
+            if face_cfg.normal_loss_weight > 0:
+                for _ds, file_list in self._iter_dataset_file_lists():
+                    cache_normal_embeddings(file_list, face_cfg)
 
         if self.depth_consistency_config is not None and (
             self.depth_consistency_config.loss_weight > 0 or self.depth_consistency_config.preview_only
@@ -960,6 +972,158 @@ class SDTrainer(BaseSDTrainProcess):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         out = total_loss / float(used)
         self.additional_logs['loss/landmark'] = float(out.item())
+        return out
+
+    def _compute_body_shape_aux_loss(
+        self,
+        noise_pred: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: 'DataLoaderBatchDTO',
+    ) -> torch.Tensor:
+        cfg = self.face_id_config
+        if cfg is None or cfg.body_shape_loss_weight <= 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if getattr(batch, 'body_shape_embedding', None) is None:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if len(noise_pred.shape) != 4:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.body_shape_model is None:
+            self.body_shape_model = DifferentiableBodyShapeEncoder()
+            self.body_shape_model.to(self.device_torch)
+            self.body_shape_model.eval()
+
+        if self.sd.x0_pred:
+            x0_pred = noise_pred
+        else:
+            tv = timesteps.to(noise_pred.device).to(noise_pred.dtype) / 1000.0
+            while len(tv.shape) < len(noise_pred.shape):
+                tv = tv.unsqueeze(-1)
+            tv = torch.clamp(tv, min=0.001)
+            x0_pred = noisy_latents - tv * noise_pred
+
+        total_steps = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        total_loss = torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        used = 0
+        ref = batch.body_shape_embedding.to(self.device_torch, dtype=torch.float32)
+        person_bboxes = getattr(batch, 'person_bboxes', None)
+
+        for i in range(ref.shape[0]):
+            if ref[i].abs().sum().item() <= 0:
+                continue
+            w = cfg.body_shape_loss_weight
+            if hasattr(batch, 'body_shape_loss_weight_list') and i < len(batch.body_shape_loss_weight_list):
+                ds_w = batch.body_shape_loss_weight_list[i]
+                if ds_w is not None:
+                    w = float(ds_w)
+            if w <= 0:
+                continue
+            min_t = cfg.body_shape_loss_min_t
+            max_t = cfg.body_shape_loss_max_t
+            if hasattr(batch, 'body_shape_loss_min_t_list') and i < len(batch.body_shape_loss_min_t_list):
+                ds_min_t = batch.body_shape_loss_min_t_list[i]
+                if ds_min_t is not None:
+                    min_t = float(ds_min_t)
+            if hasattr(batch, 'body_shape_loss_max_t_list') and i < len(batch.body_shape_loss_max_t_list):
+                ds_max_t = batch.body_shape_loss_max_t_list[i]
+                if ds_max_t is not None:
+                    max_t = float(ds_max_t)
+            t_ratio = float(timesteps[i].detach().float().item() / total_steps)
+            if t_ratio < min_t or t_ratio > max_t:
+                continue
+
+            x0_i = x0_pred[i:i + 1]
+            x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
+            x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+            bbox = [person_bboxes[i]] if person_bboxes is not None and i < len(person_bboxes) else None
+            pred = self.body_shape_model(x0_pixels, person_bboxes=bbox).to(torch.float32)
+            ref_i = ref[i:i + 1]
+            pred = torch.nn.functional.normalize(pred, p=2, dim=-1)
+            ref_i = torch.nn.functional.normalize(ref_i, p=2, dim=-1)
+            cos = torch.nn.functional.cosine_similarity(pred, ref_i, dim=-1).mean()
+            if cos.item() < float(cfg.body_shape_loss_min_cos):
+                continue
+            total_loss = total_loss + (1.0 - cos) * w
+            used += 1
+
+        if used == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        out = total_loss / float(used)
+        self.additional_logs['loss/body_shape'] = float(out.item())
+        return out
+
+    def _compute_normal_aux_loss(
+        self,
+        noise_pred: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: 'DataLoaderBatchDTO',
+    ) -> torch.Tensor:
+        cfg = self.face_id_config
+        if cfg is None or cfg.normal_loss_weight <= 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if getattr(batch, 'normal_embedding', None) is None:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if len(noise_pred.shape) != 4:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.normal_loss_model is None:
+            self.normal_loss_model = DifferentiableNormalEncoder()
+            self.normal_loss_model.to(self.device_torch)
+            self.normal_loss_model.eval()
+
+        if self.sd.x0_pred:
+            x0_pred = noise_pred
+        else:
+            tv = timesteps.to(noise_pred.device).to(noise_pred.dtype) / 1000.0
+            while len(tv.shape) < len(noise_pred.shape):
+                tv = tv.unsqueeze(-1)
+            tv = torch.clamp(tv, min=0.001)
+            x0_pred = noisy_latents - tv * noise_pred
+
+        total_steps = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        total_loss = torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        used = 0
+        ref = batch.normal_embedding.to(self.device_torch, dtype=torch.float32)
+
+        for i in range(ref.shape[0]):
+            if ref[i].abs().sum().item() <= 0:
+                continue
+            w = cfg.normal_loss_weight
+            if hasattr(batch, 'normal_loss_weight_list') and i < len(batch.normal_loss_weight_list):
+                ds_w = batch.normal_loss_weight_list[i]
+                if ds_w is not None:
+                    w = float(ds_w)
+            if w <= 0:
+                continue
+            min_t = cfg.normal_loss_min_t
+            max_t = cfg.normal_loss_max_t
+            if hasattr(batch, 'normal_loss_min_t_list') and i < len(batch.normal_loss_min_t_list):
+                ds_min_t = batch.normal_loss_min_t_list[i]
+                if ds_min_t is not None:
+                    min_t = float(ds_min_t)
+            if hasattr(batch, 'normal_loss_max_t_list') and i < len(batch.normal_loss_max_t_list):
+                ds_max_t = batch.normal_loss_max_t_list[i]
+                if ds_max_t is not None:
+                    max_t = float(ds_max_t)
+            t_ratio = float(timesteps[i].detach().float().item() / total_steps)
+            if t_ratio < min_t or t_ratio > max_t:
+                continue
+
+            x0_i = x0_pred[i:i + 1]
+            x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
+            x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+            pred = self.normal_loss_model(x0_pixels).to(torch.float32)
+            ref_i = ref[i:i + 1]
+            normal_loss = torch.nn.functional.l1_loss(pred, ref_i, reduction='mean')
+            total_loss = total_loss + normal_loss * w
+            used += 1
+
+        if used == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        out = total_loss / float(used)
+        self.additional_logs['loss/normal'] = float(out.item())
         return out
 
     def get_blank_control_image(self):
@@ -1984,6 +2148,10 @@ class SDTrainer(BaseSDTrainProcess):
         loss = loss + body_proportion_aux_loss
         landmark_aux_loss = self._compute_landmark_aux_loss(noise_pred, noisy_latents, timesteps, batch)
         loss = loss + landmark_aux_loss
+        body_shape_aux_loss = self._compute_body_shape_aux_loss(noise_pred, noisy_latents, timesteps, batch)
+        loss = loss + body_shape_aux_loss
+        normal_aux_loss = self._compute_normal_aux_loss(noise_pred, noisy_latents, timesteps, batch)
+        loss = loss + normal_aux_loss
         
         if hasattr(self.sd, "get_additional_loss"):
             additional_model_loss = self.sd.get_additional_loss(pred, target)
