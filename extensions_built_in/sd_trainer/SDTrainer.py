@@ -289,6 +289,8 @@ class SDTrainer(BaseSDTrainProcess):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if getattr(batch, 'file_items', None) is None or len(batch.file_items) == 0:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if len(noise_pred.shape) != 4:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
 
         if self.depth_encoder is None:
             self.depth_encoder = DifferentiableDepthEncoder(
