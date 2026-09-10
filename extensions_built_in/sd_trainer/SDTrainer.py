@@ -43,6 +43,7 @@ import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
 from toolkit.util.losses import wavelet_loss, stepped_loss
+from toolkit.loss_split import resolve_loss_split
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
@@ -173,6 +174,11 @@ class SDTrainer(BaseSDTrainProcess):
                 yield ds, file_list
 
     def _prime_perceptual_caches(self):
+        any_face_suppression = any(
+            getattr(ds, 'face_suppression_weight', None) is not None
+            for ds, _file_list in self._iter_dataset_file_lists()
+        )
+
         depth_roundtrip_fn = None
         if getattr(self.sd, 'arch', None) == 'ideogram4':
             def _ideogram_vae_roundtrip(arr: torch.Tensor) -> torch.Tensor:
@@ -189,20 +195,22 @@ class SDTrainer(BaseSDTrainProcess):
             for _ds, file_list in self._iter_dataset_file_lists():
                 cache_subject_masks(file_list, self.subject_mask_config, preview_dir=preview_dir)
 
-        if self.face_id_config is not None:
+        if self.face_id_config is not None or any_face_suppression:
+            face_cfg = self.face_id_config if self.face_id_config is not None else FaceIDConfig()
             need_face_cache = (
-                self.face_id_config.enabled
-                or self.face_id_config.identity_loss_weight > 0
-                or self.face_id_config.landmark_loss_weight > 0
-                or self.face_id_config.identity_metrics
+                face_cfg.enabled
+                or face_cfg.identity_loss_weight > 0
+                or face_cfg.landmark_loss_weight > 0
+                or face_cfg.identity_metrics
+                or any_face_suppression
             )
             if need_face_cache:
                 for _ds, file_list in self._iter_dataset_file_lists():
-                    cache_face_embeddings(file_list, self.face_id_config)
+                    cache_face_embeddings(file_list, face_cfg)
 
-            if self.face_id_config.vae_anchor_loss_weight > 0:
+            if face_cfg.vae_anchor_loss_weight > 0:
                 for _ds, file_list in self._iter_dataset_file_lists():
-                    cache_vae_anchor_features(file_list, self.face_id_config)
+                    cache_vae_anchor_features(file_list, face_cfg)
 
         if self.depth_consistency_config is not None and (
             self.depth_consistency_config.loss_weight > 0 or self.depth_consistency_config.preview_only
@@ -286,6 +294,8 @@ class SDTrainer(BaseSDTrainProcess):
         noisy_latents: torch.Tensor,
         timesteps: torch.Tensor,
         batch: 'DataLoaderBatchDTO',
+        loss_split_diff_depth: Optional[torch.Tensor] = None,
+        step_is_diffusion: bool = True,
     ) -> torch.Tensor:
         cfg = self.depth_consistency_config
         if cfg is None or (cfg.loss_weight <= 0 and not cfg.preview_only):
@@ -330,6 +340,9 @@ class SDTrainer(BaseSDTrainProcess):
             if w <= 0:
                 continue
 
+            if loss_split_diff_depth is not None and step_is_diffusion and bool(loss_split_diff_depth[i].item()):
+                continue
+
             min_t = cfg.loss_min_t
             max_t = cfg.loss_max_t
             if hasattr(batch, 'depth_loss_min_t_list') and i < len(batch.depth_loss_min_t_list):
@@ -352,11 +365,21 @@ class SDTrainer(BaseSDTrainProcess):
             if gt_i.dim() == 2:
                 gt_i = gt_i.unsqueeze(0)
 
+            mask_i = None
+            if cfg.mask_source == 'subject':
+                m = getattr(file_item, 'subject_mask', None)
+                if m is not None:
+                    mask_i = m.to(self.device_torch, dtype=torch.float32)
+            elif cfg.mask_source == 'body':
+                m = getattr(file_item, 'body_mask', None)
+                if m is not None:
+                    mask_i = m.to(self.device_torch, dtype=torch.float32)
+
             loss_i, ssi_i, grad_i, _, _ = compute_depth_consistency_loss(
                 self.depth_encoder,
                 x0_pixels,
                 gt_i,
-                mask=None,
+                mask=mask_i,
                 ssi_weight=cfg.ssi_weight,
                 grad_weight=cfg.grad_weight,
                 grad_scales=cfg.grad_scales,
@@ -568,6 +591,81 @@ class SDTrainer(BaseSDTrainProcess):
         anchor_loss = total_loss / float(used)
         self.additional_logs['loss/vae_anchor'] = float(anchor_loss.item())
         return anchor_loss
+
+    def _apply_face_suppression(
+        self,
+        mask_multiplier: torch.Tensor,
+        batch: 'DataLoaderBatchDTO',
+        latent_h: int,
+        latent_w: int,
+    ) -> torch.Tensor:
+        if len(mask_multiplier.shape) != 4:
+            return mask_multiplier
+        if getattr(batch, 'file_items', None) is None or len(batch.file_items) == 0:
+            return mask_multiplier
+
+        global_w = getattr(self.face_id_config, 'face_suppression_weight', None) if self.face_id_config else None
+        global_expand = float(getattr(self.face_id_config, 'face_suppression_expand', 2.0)) if self.face_id_config else 2.0
+        global_soft = bool(getattr(self.face_id_config, 'face_suppression_soft', False)) if self.face_id_config else False
+
+        weights = getattr(batch, 'face_suppression_weight_list', None) or [None] * len(batch.file_items)
+        expands = getattr(batch, 'face_suppression_expand_list', None) or [None] * len(batch.file_items)
+        softs = getattr(batch, 'face_suppression_soft_list', None) or [None] * len(batch.file_items)
+
+        out = mask_multiplier
+        for i, file_item in enumerate(batch.file_items):
+            fsw = weights[i] if i < len(weights) and weights[i] is not None else global_w
+            if fsw is None:
+                continue
+            fsw = float(fsw)
+            if fsw >= 0.999:
+                continue
+
+            bbox = getattr(file_item, 'face_bbox', None)
+            if bbox is None:
+                continue
+
+            fse = expands[i] if i < len(expands) and expands[i] is not None else global_expand
+            fss = softs[i] if i < len(softs) and softs[i] is not None else global_soft
+            fse = float(fse)
+            fss = bool(fss)
+
+            src_w = float(getattr(file_item, 'crop_width', file_item.width) or file_item.width)
+            src_h = float(getattr(file_item, 'crop_height', file_item.height) or file_item.height)
+            if src_w <= 1 or src_h <= 1:
+                continue
+
+            x1, y1, x2, y2 = [float(v) for v in bbox.tolist()]
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            bw = max(1.0, (x2 - x1) * fse)
+            bh = max(1.0, (y2 - y1) * fse)
+            ex1 = max(0.0, cx - 0.5 * bw)
+            ey1 = max(0.0, cy - 0.5 * bh)
+            ex2 = min(src_w, cx + 0.5 * bw)
+            ey2 = min(src_h, cy + 0.5 * bh)
+
+            lx1 = int(max(0, min(latent_w, round(ex1 * latent_w / src_w))))
+            ly1 = int(max(0, min(latent_h, round(ey1 * latent_h / src_h))))
+            lx2 = int(max(0, min(latent_w, round(ex2 * latent_w / src_w))))
+            ly2 = int(max(0, min(latent_h, round(ey2 * latent_h / src_h))))
+            if lx2 <= lx1 or ly2 <= ly1:
+                continue
+
+            if not fss:
+                out[i, :, ly1:ly2, lx1:lx2] = out[i, :, ly1:ly2, lx1:lx2] * fsw
+            else:
+                yy = torch.arange(latent_h, device=out.device, dtype=out.dtype).view(-1, 1)
+                xx = torch.arange(latent_w, device=out.device, dtype=out.dtype).view(1, -1)
+                cx_l = 0.5 * (lx1 + lx2)
+                cy_l = 0.5 * (ly1 + ly2)
+                sx = max(1.0, (lx2 - lx1) / 2.0)
+                sy = max(1.0, (ly2 - ly1) / 2.0)
+                g = torch.exp(-0.5 * (((xx - cx_l) / sx) ** 2 + ((yy - cy_l) / sy) ** 2))
+                damp = 1.0 - (1.0 - fsw) * g
+                out[i] = out[i] * damp.unsqueeze(0)
+
+        return out
 
     def get_blank_control_image(self):
         # noise instead of a black image so the fallback does not read as a
@@ -982,7 +1080,46 @@ class SDTrainer(BaseSDTrainProcess):
             **kwargs
     ):
         loss_target = self.train_config.loss_target
-        is_reg = any(batch.get_is_reg_list())
+        is_reg_list = batch.get_is_reg_list()
+        is_reg = any(is_reg_list)
+        is_reg_per_sample = torch.tensor(
+            [bool(v) for v in is_reg_list],
+            device=self.device_torch,
+            dtype=torch.bool,
+        )
+
+        split_list_raw = getattr(batch, 'loss_split_list', None) or [None] * is_reg_per_sample.shape[0]
+        global_split = getattr(self.train_config, 'loss_split', None)
+        global_split_explicit = bool(getattr(self.train_config, '_loss_split_explicit', False))
+        global_depth_weight = (
+            float(self.depth_consistency_config.loss_weight)
+            if self.depth_consistency_config is not None
+            else 0.0
+        )
+        per_sample_depth_weight = getattr(batch, 'depth_loss_weight_list', None)
+
+        def _effective_depth_weight(i: int) -> float:
+            if per_sample_depth_weight is not None and i < len(per_sample_depth_weight):
+                ds_w = per_sample_depth_weight[i]
+                if ds_w is not None:
+                    return float(ds_w)
+            return global_depth_weight
+
+        split_list = [
+            resolve_loss_split(
+                ds_value=v,
+                global_value=global_split,
+                global_explicit=global_split_explicit,
+                effective_depth_weight=_effective_depth_weight(i),
+            )
+            for i, v in enumerate(split_list_raw)
+        ]
+        loss_split_diff_depth = torch.tensor(
+            [s == 'diffusion_depth' for s in split_list],
+            device=self.device_torch,
+            dtype=torch.bool,
+        )
+        step_is_diffusion = (self.step_num % 2 == 0)
         additional_loss = 0.0
 
         prior_mask_multiplier = None
@@ -1000,6 +1137,9 @@ class SDTrainer(BaseSDTrainProcess):
 
         with torch.no_grad():
             loss_multiplier = torch.tensor(batch.loss_multiplier_list).to(self.device_torch, dtype=torch.float32)
+            if loss_split_diff_depth.any() and (not step_is_diffusion):
+                split_gate = (~loss_split_diff_depth).to(loss_multiplier.device, dtype=loss_multiplier.dtype)
+                loss_multiplier = loss_multiplier * split_gate
 
         if self.train_config.match_noise_norm:
             # match the norm of the noise
@@ -1437,6 +1577,14 @@ class SDTrainer(BaseSDTrainProcess):
             # resize to the size of the loss
             mask_multiplier = torch.nn.functional.interpolate(mask_multiplier, size=(pred.shape[2], pred.shape[3]), mode='nearest')
 
+        if len(noise_pred.shape) == 4 and torch.is_tensor(mask_multiplier):
+            mask_multiplier = self._apply_face_suppression(
+                mask_multiplier,
+                batch,
+                latent_h=pred.shape[2],
+                latent_w=pred.shape[3],
+            )
+
         # multiply by our mask
         try:
             if len(noise_pred.shape) == 5:
@@ -1522,7 +1670,14 @@ class SDTrainer(BaseSDTrainProcess):
 
         loss = loss + additional_loss
 
-        depth_aux_loss = self._compute_depth_aux_loss(noise_pred, noisy_latents, timesteps, batch)
+        depth_aux_loss = self._compute_depth_aux_loss(
+            noise_pred,
+            noisy_latents,
+            timesteps,
+            batch,
+            loss_split_diff_depth=loss_split_diff_depth,
+            step_is_diffusion=step_is_diffusion,
+        )
         loss = loss + depth_aux_loss
         identity_aux_loss = self._compute_identity_aux_loss(noise_pred, noisy_latents, timesteps, batch)
         loss = loss + identity_aux_loss

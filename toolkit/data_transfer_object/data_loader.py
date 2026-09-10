@@ -203,6 +203,9 @@ class FileItemDTO(
         self.vae_anchor_loss_weight = getattr(self.dataset_config, 'vae_anchor_loss_weight', None)
         self.vae_anchor_loss_min_t = getattr(self.dataset_config, 'vae_anchor_loss_min_t', None)
         self.vae_anchor_loss_max_t = getattr(self.dataset_config, 'vae_anchor_loss_max_t', None)
+        self.face_suppression_weight = getattr(self.dataset_config, 'face_suppression_weight', None)
+        self.face_suppression_expand = getattr(self.dataset_config, 'face_suppression_expand', None)
+        self.face_suppression_soft = getattr(self.dataset_config, 'face_suppression_soft', None)
         self.latent_perceptual_loss_weight = getattr(self.dataset_config, 'latent_perceptual_loss_weight', None)
         self.latent_perceptual_loss_min_t = getattr(self.dataset_config, 'latent_perceptual_loss_min_t', None)
         self.latent_perceptual_loss_max_t = getattr(self.dataset_config, 'latent_perceptual_loss_max_t', None)
@@ -377,11 +380,47 @@ class DataLoaderBatchDTO:
             self.vae_anchor_loss_weight_list = [x.vae_anchor_loss_weight for x in self.file_items]
             self.vae_anchor_loss_min_t_list = [x.vae_anchor_loss_min_t for x in self.file_items]
             self.vae_anchor_loss_max_t_list = [x.vae_anchor_loss_max_t for x in self.file_items]
+            self.face_suppression_weight_list = [x.face_suppression_weight for x in self.file_items]
+            self.face_suppression_expand_list = [x.face_suppression_expand for x in self.file_items]
+            self.face_suppression_soft_list = [x.face_suppression_soft for x in self.file_items]
             self.latent_perceptual_loss_weight_list = [x.latent_perceptual_loss_weight for x in self.file_items]
             self.latent_perceptual_loss_min_t_list = [x.latent_perceptual_loss_min_t for x in self.file_items]
             self.latent_perceptual_loss_max_t_list = [x.latent_perceptual_loss_max_t for x in self.file_items]
             self.perceptual_restrict_to_body_list = [x.perceptual_restrict_to_body for x in self.file_items]
             self.loss_split_list = [x.loss_split for x in self.file_items]
+
+            if any([getattr(x, 'subject_mask', None) is not None for x in self.file_items]):
+                base_subject_mask = next(getattr(x, 'subject_mask', None) for x in self.file_items if getattr(x, 'subject_mask', None) is not None)
+                subject_masks = []
+                for x in self.file_items:
+                    sm = getattr(x, 'subject_mask', None)
+                    if sm is None:
+                        subject_masks.append(torch.zeros_like(base_subject_mask, dtype=torch.bool))
+                    else:
+                        subject_masks.append(sm)
+                self.subject_masks = torch.stack(subject_masks, dim=0).unsqueeze(1)
+
+            if any([getattr(x, 'body_mask', None) is not None for x in self.file_items]):
+                base_body_mask = next(getattr(x, 'body_mask', None) for x in self.file_items if getattr(x, 'body_mask', None) is not None)
+                body_masks = []
+                for x in self.file_items:
+                    bm = getattr(x, 'body_mask', None)
+                    if bm is None:
+                        body_masks.append(torch.zeros_like(base_body_mask, dtype=torch.bool))
+                    else:
+                        body_masks.append(bm)
+                self.body_masks = torch.stack(body_masks, dim=0).unsqueeze(1)
+
+            if any([getattr(x, 'clothing_mask', None) is not None for x in self.file_items]):
+                base_clothing_mask = next(getattr(x, 'clothing_mask', None) for x in self.file_items if getattr(x, 'clothing_mask', None) is not None)
+                clothing_masks = []
+                for x in self.file_items:
+                    cm = getattr(x, 'clothing_mask', None)
+                    if cm is None:
+                        clothing_masks.append(torch.zeros_like(base_clothing_mask, dtype=torch.bool))
+                    else:
+                        clothing_masks.append(cm)
+                self.clothing_masks = torch.stack(clothing_masks, dim=0).unsqueeze(1)
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
                 # find one to use as a base
