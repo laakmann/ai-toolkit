@@ -391,6 +391,15 @@ class BadStateGuardConfig:
         self.warmup_steps = kwargs.get("warmup_steps", 0)
 
 
+class WeightNoiseConfig:
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        self.mode: str = str(kwargs.get('mode', 'relative'))
+        self.sigma: float = float(kwargs.get('sigma', 1.25e-2))
+        self.log_every: int = int(kwargs.get('log_every', 50))
+        self.bound_norm: bool = bool(kwargs.get('bound_norm', False))
+
+
 ContentOrStyleType = Literal['balanced', 'style', 'content']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
@@ -469,6 +478,7 @@ class TrainConfig:
         self.log_loss_by_dataset = kwargs.get("log_loss_by_dataset", False)
         self.log_loss_by_dataset_raw = kwargs.get("log_loss_by_dataset_raw", False)
         self.bad_state_guard = BadStateGuardConfig(**kwargs.get("bad_state_guard", {}))
+        self.weight_noise = WeightNoiseConfig(**(kwargs.get('weight_noise', {}) or {}))
         self.num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
         # automatically adapte the vae scaling based on the image norm
         self.adaptive_scaling_factor = kwargs.get('adaptive_scaling_factor', False)

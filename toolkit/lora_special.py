@@ -129,6 +129,12 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.module_dropout = module_dropout
         self.is_checkpointing = False
 
+        self.lora_down.weight._is_lora = True
+        if hasattr(self.lora_up, 'weight'):
+            self.lora_up.weight._is_lora = True
+        if use_bias and getattr(self.lora_up, 'bias', None) is not None:
+            self.lora_up.bias._is_lora = True
+
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
@@ -191,6 +197,9 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             self.diff_b = torch.nn.Parameter(torch.zeros_like(org_bias))
         else:
             self.diff_b = None
+        self.diff._is_lora = True
+        if self.diff_b is not None:
+            self.diff_b._is_lora = True
 
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
@@ -773,5 +782,4 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 all_params.append({"lr": unet_lr, "params": list(self.unet_conv_out.parameters())})
 
         return all_params
-
 

@@ -142,6 +142,61 @@ class SDTrainer(BaseSDTrainProcess):
     def before_model_load(self):
         pass
 
+    @torch.no_grad()
+    def _inject_weight_noise(self) -> None:
+        cfg = getattr(self.train_config, 'weight_noise', None)
+        if cfg is None or not cfg.enabled:
+            return
+
+        mode = str(getattr(cfg, 'mode', 'relative')).lower()
+        sigma_base = float(getattr(cfg, 'sigma', 0.0))
+        if sigma_base <= 0.0:
+            return
+
+        noise_sq = 0.0
+        weight_sq = 0.0
+
+        for group in self.optimizer.param_groups:
+            for p in group.get('params', []):
+                if p is None or p.data is None or p.numel() == 0:
+                    continue
+                if not getattr(p, '_is_lora', False):
+                    continue
+
+                param_data = p.data
+                if mode == 'relative':
+                    rms = param_data.float().pow(2).mean().sqrt()
+                    if not torch.isfinite(rms) or rms.item() == 0.0:
+                        continue
+                    sigma = sigma_base * float(rms.item())
+                elif mode == 'absolute':
+                    sigma = sigma_base
+                else:
+                    continue
+
+                if sigma <= 0.0:
+                    continue
+
+                pre_norm = None
+                if getattr(cfg, 'bound_norm', False):
+                    pre_norm = param_data.float().norm().clamp(min=1e-12)
+
+                noise = torch.randn_like(param_data) * sigma
+                param_data.add_(noise)
+
+                if pre_norm is not None:
+                    post_norm = param_data.float().norm().clamp(min=1e-12)
+                    scale = (pre_norm / post_norm).to(device=param_data.device, dtype=param_data.dtype)
+                    param_data.mul_(scale)
+
+                noise_sq += noise.float().pow(2).sum().item()
+                weight_sq += param_data.float().pow(2).sum().item()
+
+        log_every = int(getattr(cfg, 'log_every', 0) or 0)
+        if log_every > 0 and self.step_num % log_every == 0:
+            self.additional_logs['weight_noise_norm'] = float(noise_sq ** 0.5)
+            self.additional_logs['weight_norm'] = float(weight_sq ** 0.5)
+
     def get_blank_control_image(self):
         # noise instead of a black image so the fallback does not read as a
         # meaningful (solid black) reference
@@ -2702,6 +2757,7 @@ class SDTrainer(BaseSDTrainProcess):
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
+            self._inject_weight_noise()
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
