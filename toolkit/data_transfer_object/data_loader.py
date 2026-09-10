@@ -241,6 +241,8 @@ class DataLoaderBatchDTO:
             self.tensor: Union[torch.Tensor, None] = None
             self.latents: Union[torch.Tensor, None] = None
             self.body_proportion_embedding: Union[torch.Tensor, None] = None
+            self.landmark_embedding: Union[torch.Tensor, None] = None
+            self.face_bboxes: Union[List, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
@@ -400,6 +402,20 @@ class DataLoaderBatchDTO:
                     else:
                         bp_items.append(bp)
                 self.body_proportion_embedding = torch.stack(bp_items, dim=0)
+
+            if any([getattr(x, 'landmark_embedding', None) is not None for x in self.file_items]):
+                base_lm = next(getattr(x, 'landmark_embedding', None) for x in self.file_items if getattr(x, 'landmark_embedding', None) is not None)
+                lm_items = []
+                for x in self.file_items:
+                    lm = getattr(x, 'landmark_embedding', None)
+                    if lm is None:
+                        lm_items.append(torch.zeros_like(base_lm))
+                    else:
+                        lm_items.append(lm)
+                self.landmark_embedding = torch.stack(lm_items, dim=0)
+
+            if any([getattr(x, 'face_bbox', None) is not None for x in self.file_items]):
+                self.face_bboxes = [getattr(x, 'face_bbox', None) for x in self.file_items]
 
             if any([getattr(x, 'subject_mask', None) is not None for x in self.file_items]):
                 base_subject_mask = next(getattr(x, 'subject_mask', None) for x in self.file_items if getattr(x, 'subject_mask', None) is not None)
