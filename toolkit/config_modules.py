@@ -479,6 +479,18 @@ class TrainConfig:
         self.log_loss_by_dataset_raw = kwargs.get("log_loss_by_dataset_raw", False)
         self.bad_state_guard = BadStateGuardConfig(**kwargs.get("bad_state_guard", {}))
         self.weight_noise = WeightNoiseConfig(**(kwargs.get('weight_noise', {}) or {}))
+        self._loss_split_explicit: bool = ('loss_split' in kwargs)
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split not in ('diffusion_depth',):
+            raise ValueError(
+                f"Unknown train.loss_split value: {self.loss_split!r}. "
+                "Allowed: None, 'diffusion_depth', or omit key for autodetect."
+            )
+        self.latent_perceptual_loss_weight: float = float(kwargs.get('latent_perceptual_loss_weight', 0.0))
+        self.latent_perceptual_loss_min_t: float = float(kwargs.get('latent_perceptual_loss_min_t', 0.0))
+        self.latent_perceptual_loss_max_t: float = float(kwargs.get('latent_perceptual_loss_max_t', 0.5))
+        self.latent_perceptual_encoder: str = kwargs.get('latent_perceptual_encoder', 'auto')
+        self.latent_perceptual_preview_every: int = int(kwargs.get('latent_perceptual_preview_every', 500))
         self.num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
         # automatically adapte the vae scaling based on the image norm
         self.adaptive_scaling_factor = kwargs.get('adaptive_scaling_factor', False)
@@ -663,7 +675,7 @@ class TrainConfig:
             self.validation_config: ValidationConfig = ValidationConfig(**validation)
 
 
-ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21', 'anima']
+ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21', 'anima', 'ideogram4']
 
 
 class ModelConfig:
@@ -1089,6 +1101,30 @@ class DatasetConfig:
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
+        self.diffusion_loss_weight: Union[float, None] = kwargs.get('diffusion_loss_weight', None)
+        self.depth_loss_weight: Union[float, None] = kwargs.get('depth_loss_weight', None)
+        self.depth_loss_min_t: Union[float, None] = kwargs.get('depth_loss_min_t', None)
+        self.depth_loss_max_t: Union[float, None] = kwargs.get('depth_loss_max_t', None)
+        self.identity_loss_weight: Union[float, None] = kwargs.get('identity_loss_weight', None)
+        self.identity_loss_min_t: Union[float, None] = kwargs.get('identity_loss_min_t', None)
+        self.identity_loss_max_t: Union[float, None] = kwargs.get('identity_loss_max_t', None)
+        self.identity_loss_min_cos: Union[float, None] = kwargs.get('identity_loss_min_cos', None)
+        self.body_proportion_loss_weight: Union[float, None] = kwargs.get('body_proportion_loss_weight', None)
+        self.body_proportion_loss_min_t: Union[float, None] = kwargs.get('body_proportion_loss_min_t', None)
+        self.body_proportion_loss_max_t: Union[float, None] = kwargs.get('body_proportion_loss_max_t', None)
+        self.vae_anchor_loss_weight: Union[float, None] = kwargs.get('vae_anchor_loss_weight', None)
+        self.vae_anchor_loss_min_t: Union[float, None] = kwargs.get('vae_anchor_loss_min_t', None)
+        self.vae_anchor_loss_max_t: Union[float, None] = kwargs.get('vae_anchor_loss_max_t', None)
+        self.latent_perceptual_loss_weight: Union[float, None] = kwargs.get('latent_perceptual_loss_weight', None)
+        self.latent_perceptual_loss_min_t: Union[float, None] = kwargs.get('latent_perceptual_loss_min_t', None)
+        self.latent_perceptual_loss_max_t: Union[float, None] = kwargs.get('latent_perceptual_loss_max_t', None)
+        self.perceptual_restrict_to_body: Union[bool, None] = kwargs.get('perceptual_restrict_to_body', None)
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split not in ('diffusion_depth', 'sum'):
+            raise ValueError(
+                f"Unknown loss_split value: {self.loss_split!r}. "
+                "Allowed: None, 'diffusion_depth', 'sum'."
+            )
         self.reg_consistency_multiplier = kwargs.get("reg_consistency_multiplier", None)
         self.reg_consistency_mode = kwargs.get("reg_consistency_mode", None)
         self.reg_consistency_loss_type = kwargs.get("reg_consistency_loss_type", None)

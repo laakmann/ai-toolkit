@@ -188,6 +188,24 @@ class FileItemDTO(
         self.flip_y: bool = kwargs.get("flip_x", False)
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
+        self.depth_loss_weight = getattr(self.dataset_config, 'depth_loss_weight', None)
+        self.depth_loss_min_t = getattr(self.dataset_config, 'depth_loss_min_t', None)
+        self.depth_loss_max_t = getattr(self.dataset_config, 'depth_loss_max_t', None)
+        self.identity_loss_weight = getattr(self.dataset_config, 'identity_loss_weight', None)
+        self.identity_loss_min_t = getattr(self.dataset_config, 'identity_loss_min_t', None)
+        self.identity_loss_max_t = getattr(self.dataset_config, 'identity_loss_max_t', None)
+        self.identity_loss_min_cos = getattr(self.dataset_config, 'identity_loss_min_cos', None)
+        self.body_proportion_loss_weight = getattr(self.dataset_config, 'body_proportion_loss_weight', None)
+        self.body_proportion_loss_min_t = getattr(self.dataset_config, 'body_proportion_loss_min_t', None)
+        self.body_proportion_loss_max_t = getattr(self.dataset_config, 'body_proportion_loss_max_t', None)
+        self.vae_anchor_loss_weight = getattr(self.dataset_config, 'vae_anchor_loss_weight', None)
+        self.vae_anchor_loss_min_t = getattr(self.dataset_config, 'vae_anchor_loss_min_t', None)
+        self.vae_anchor_loss_max_t = getattr(self.dataset_config, 'vae_anchor_loss_max_t', None)
+        self.latent_perceptual_loss_weight = getattr(self.dataset_config, 'latent_perceptual_loss_weight', None)
+        self.latent_perceptual_loss_min_t = getattr(self.dataset_config, 'latent_perceptual_loss_min_t', None)
+        self.latent_perceptual_loss_max_t = getattr(self.dataset_config, 'latent_perceptual_loss_max_t', None)
+        self.perceptual_restrict_to_body = getattr(self.dataset_config, 'perceptual_restrict_to_body', None)
+        self.loss_split = getattr(self.dataset_config, 'loss_split', None)
 
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
@@ -343,6 +361,24 @@ class DataLoaderBatchDTO:
             self.loss_multiplier_list: List[float] = [
                 x.loss_multiplier for x in self.file_items
             ]
+            self.depth_loss_weight_list = [x.depth_loss_weight for x in self.file_items]
+            self.depth_loss_min_t_list = [x.depth_loss_min_t for x in self.file_items]
+            self.depth_loss_max_t_list = [x.depth_loss_max_t for x in self.file_items]
+            self.identity_loss_weight_list = [x.identity_loss_weight for x in self.file_items]
+            self.identity_loss_min_t_list = [x.identity_loss_min_t for x in self.file_items]
+            self.identity_loss_max_t_list = [x.identity_loss_max_t for x in self.file_items]
+            self.identity_loss_min_cos_list = [x.identity_loss_min_cos for x in self.file_items]
+            self.body_proportion_loss_weight_list = [x.body_proportion_loss_weight for x in self.file_items]
+            self.body_proportion_loss_min_t_list = [x.body_proportion_loss_min_t for x in self.file_items]
+            self.body_proportion_loss_max_t_list = [x.body_proportion_loss_max_t for x in self.file_items]
+            self.vae_anchor_loss_weight_list = [x.vae_anchor_loss_weight for x in self.file_items]
+            self.vae_anchor_loss_min_t_list = [x.vae_anchor_loss_min_t for x in self.file_items]
+            self.vae_anchor_loss_max_t_list = [x.vae_anchor_loss_max_t for x in self.file_items]
+            self.latent_perceptual_loss_weight_list = [x.latent_perceptual_loss_weight for x in self.file_items]
+            self.latent_perceptual_loss_min_t_list = [x.latent_perceptual_loss_min_t for x in self.file_items]
+            self.latent_perceptual_loss_max_t_list = [x.latent_perceptual_loss_max_t for x in self.file_items]
+            self.perceptual_restrict_to_body_list = [x.perceptual_restrict_to_body for x in self.file_items]
+            self.loss_split_list = [x.loss_split for x in self.file_items]
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
                 # find one to use as a base
