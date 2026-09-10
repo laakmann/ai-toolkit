@@ -110,6 +110,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.depth_encoder: Optional[DifferentiableDepthEncoder] = None
         self.identity_encoder: Optional[DifferentiableFaceEncoder] = None
         self.vae_anchor_encoder: Optional[VAEAnchorEncoder] = None
+        self.latent_perceptual_model = None
+        self._latent_perceptual_import_failed = False
         self._dataset_series_key_by_id = {}
         self._dataset_sequence_by_series_key = {}
         self._dataset_label_by_series_key = {}
@@ -666,6 +668,111 @@ class SDTrainer(BaseSDTrainProcess):
                 out[i] = out[i] * damp.unsqueeze(0)
 
         return out
+
+    def _compute_latent_perceptual_loss(
+        self,
+        noise_pred: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: 'DataLoaderBatchDTO',
+    ) -> torch.Tensor:
+        if self.train_config.latent_perceptual_loss_weight <= 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if len(noise_pred.shape) != 4:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.latent_perceptual_model is None and not self._latent_perceptual_import_failed:
+            try:
+                from elatentlpips import ELatentLPIPS
+
+                encoder_name = getattr(self.train_config, 'latent_perceptual_encoder', 'auto')
+                if encoder_name == 'auto':
+                    encoder_name = 'flux' if noise_pred.shape[1] >= 16 else 'sdxl'
+                self.latent_perceptual_model = ELatentLPIPS(model_type=encoder_name).to(self.device_torch)
+                self.latent_perceptual_model.eval()
+            except Exception as e:
+                self._latent_perceptual_import_failed = True
+                print_acc(f"Latent perceptual loss disabled: {e}")
+                return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.latent_perceptual_model is None:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        bs = noise_pred.shape[0]
+        num_train_ts = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        t_01 = (timesteps.float() / num_train_ts).to(noise_pred.device)
+        global_min_t = self.train_config.latent_perceptual_loss_min_t
+        global_max_t = self.train_config.latent_perceptual_loss_max_t
+        min_vals = torch.tensor(
+            [v if v is not None else global_min_t for v in batch.latent_perceptual_loss_min_t_list],
+            device=t_01.device,
+            dtype=t_01.dtype,
+        )
+        max_vals = torch.tensor(
+            [v if v is not None else global_max_t for v in batch.latent_perceptual_loss_max_t_list],
+            device=t_01.device,
+            dtype=t_01.dtype,
+        )
+        t_mask = ((t_01 >= min_vals) & (t_01 <= max_vals)).float()
+        is_reg_lp = torch.tensor([bool(v) for v in batch.get_is_reg_list()], device=t_01.device, dtype=torch.bool)
+        t_mask = t_mask * (~is_reg_lp).float()
+
+        per_sample_weights = torch.full(
+            (bs,),
+            float(self.train_config.latent_perceptual_loss_weight),
+            device=noise_pred.device,
+        )
+        for idx, w in enumerate(batch.latent_perceptual_loss_weight_list):
+            if w is not None:
+                per_sample_weights[idx] = float(w)
+        sample_weights = t_mask * per_sample_weights
+        if sample_weights.sum().item() < 1e-8:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.sd.x0_pred:
+            x0_pred = noise_pred
+        elif self.sd.is_flow_matching:
+            t_expand = t_01.view(-1, 1, 1, 1)
+            x0_pred = noisy_latents - t_expand * noise_pred
+        else:
+            alphas_cumprod = self.sd.noise_scheduler.alphas_cumprod.to(
+                device=timesteps.device,
+                dtype=noisy_latents.dtype,
+            )
+            alpha_bar = alphas_cumprod[timesteps.long()].view(-1, 1, 1, 1)
+            sqrt_alpha_bar = alpha_bar.sqrt()
+            sqrt_one_minus_alpha_bar = (1.0 - alpha_bar).sqrt()
+            if getattr(self.sd, 'prediction_type', None) == 'v_prediction':
+                x0_pred = sqrt_alpha_bar * noisy_latents - sqrt_one_minus_alpha_bar * noise_pred
+            else:
+                x0_pred = (noisy_latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar.clamp(min=1e-8)
+
+        target_latents = batch.latents.to(noise_pred.device, dtype=noise_pred.dtype).detach()
+
+        x0_for_lp = x0_pred
+        tgt_for_lp = target_latents
+        ch = x0_for_lp.shape[1]
+        if ch > 16 and ch % 4 == 0:
+            from einops import rearrange
+
+            z_ch = ch // 4
+            x0_for_lp = rearrange(x0_for_lp, "b (c p1 p2) h w -> b c (h p1) (w p2)", c=z_ch, p1=2, p2=2)
+            tgt_for_lp = rearrange(tgt_for_lp, "b (c p1 p2) h w -> b c (h p1) (w p2)", c=z_ch, p1=2, p2=2)
+        if x0_for_lp.shape[1] > 16:
+            x0_for_lp = x0_for_lp[:, :16]
+            tgt_for_lp = tgt_for_lp[:, :16]
+
+        lp_loss = self.latent_perceptual_model(
+            x0_for_lp.float(),
+            tgt_for_lp.float(),
+            normalize=False,
+            add_l1_loss=True,
+            ensembling=False,
+        ).view(bs)
+        weighted_loss = (lp_loss * sample_weights).mean()
+        self.additional_logs['loss/latent_perceptual'] = float(lp_loss.detach().mean().item())
+        self.additional_logs['loss/latent_perceptual_applied'] = float(weighted_loss.detach().item())
+        return weighted_loss
 
     def get_blank_control_image(self):
         # noise instead of a black image so the fallback does not read as a
@@ -1683,6 +1790,8 @@ class SDTrainer(BaseSDTrainProcess):
         loss = loss + identity_aux_loss
         vae_anchor_aux_loss = self._compute_vae_anchor_aux_loss(noise_pred, noisy_latents, timesteps, batch)
         loss = loss + vae_anchor_aux_loss
+        latent_perceptual_aux_loss = self._compute_latent_perceptual_loss(noise_pred, noisy_latents, timesteps, batch)
+        loss = loss + latent_perceptual_aux_loss
         
         if hasattr(self.sd, "get_additional_loss"):
             additional_model_loss = self.sd.get_additional_loss(pred, target)
