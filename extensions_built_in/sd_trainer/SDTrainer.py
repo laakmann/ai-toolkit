@@ -27,6 +27,10 @@ from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
+from toolkit.depth_consistency import cache_depth_gt_embeddings
+from toolkit.face_id import cache_face_embeddings
+from toolkit.subject_mask import cache_subject_masks
+from toolkit.vae_anchor import cache_vae_anchor_features
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
     apply_learnable_snr_gos, LearnableSNRGamma, compute_reg_consistency_loss
 import gc
@@ -152,6 +156,49 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
+
+    def _iter_dataset_file_lists(self):
+        all_sets = []
+        if getattr(self, 'datasets', None) is not None:
+            all_sets.extend(self.datasets)
+        if getattr(self, 'datasets_reg', None) is not None:
+            all_sets.extend(self.datasets_reg)
+        for ds in all_sets:
+            file_list = getattr(ds, 'file_list', None)
+            if file_list:
+                yield ds, file_list
+
+    def _prime_perceptual_caches(self):
+        if self.subject_mask_config is not None and self.subject_mask_config.enabled:
+            preview_dir = os.path.join(self.save_root, 'subject_mask_previews')
+            for _ds, file_list in self._iter_dataset_file_lists():
+                cache_subject_masks(file_list, self.subject_mask_config, preview_dir=preview_dir)
+
+        if self.face_id_config is not None:
+            need_face_cache = (
+                self.face_id_config.enabled
+                or self.face_id_config.identity_loss_weight > 0
+                or self.face_id_config.landmark_loss_weight > 0
+                or self.face_id_config.identity_metrics
+            )
+            if need_face_cache:
+                for _ds, file_list in self._iter_dataset_file_lists():
+                    cache_face_embeddings(file_list, self.face_id_config)
+
+            if self.face_id_config.vae_anchor_loss_weight > 0:
+                for _ds, file_list in self._iter_dataset_file_lists():
+                    cache_vae_anchor_features(file_list, self.face_id_config)
+
+        if self.depth_consistency_config is not None and (
+            self.depth_consistency_config.loss_weight > 0 or self.depth_consistency_config.preview_only
+        ):
+            for _ds, file_list in self._iter_dataset_file_lists():
+                cache_depth_gt_embeddings(
+                    file_list,
+                    self.depth_consistency_config,
+                    vae_roundtrip_fn=None,
+                    store_as_single_frame_video=False,
+                )
 
     @torch.no_grad()
     def _inject_weight_noise(self) -> None:
@@ -357,6 +404,7 @@ class SDTrainer(BaseSDTrainProcess):
         
 
     def before_dataset_load(self):
+        self._prime_perceptual_caches()
         self.assistant_adapter = None
         # get adapter assistant if one is set
         if self.train_config.adapter_assist_name_or_path is not None:
