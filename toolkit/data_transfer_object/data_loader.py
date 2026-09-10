@@ -14,6 +14,7 @@ from toolkit.dataloader_mixins import (
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
     LatentCachingFileItemDTOMixin,
+    DepthCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
@@ -45,6 +46,7 @@ def print_once(msg):
 
 class FileItemDTO(
     LatentCachingFileItemDTOMixin,
+    DepthCachingFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -219,6 +221,7 @@ class FileItemDTO(
         self.audio_data = None
         self.audio_tensor = None
         self.cleanup_latent()
+        self.cleanup_depth()
         self.cleanup_text_embedding()
         self.cleanup_control()
         self.cleanup_inpaint()

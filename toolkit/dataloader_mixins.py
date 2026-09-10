@@ -8,12 +8,13 @@ import os
 import random
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, List, Dict, Union
+from typing import TYPE_CHECKING, List, Dict, Union, Optional
 import traceback
 
 import cv2
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
@@ -1924,6 +1925,54 @@ class LatentCachingFileItemDTOMixin:
                 # audio-only models use the waveform as the main tensor
                 self.tensor = waveform
         return self._encoded_latent
+
+
+class DepthCachingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        self.depth_gt: Union[torch.Tensor, None] = None
+        self.is_depth_cached = False
+        self._depth_cache_path: Union[str, None] = None
+        self._depth_cache_key: Union[str, None] = None
+        self.depth_gt_video: Union[torch.Tensor, None] = None
+        self.is_depth_video_cached = False
+        self._depth_video_cache_path: Union[str, None] = None
+        self._depth_video_cache_key: Union[str, None] = None
+
+    @staticmethod
+    def _read_depth_key(cache_path: Optional[str], key: Optional[str]):
+        if cache_path is None or key is None:
+            return None
+        try:
+            with safe_open(cache_path, framework="pt", device="cpu") as f:
+                if key in f.keys():
+                    return f.get_tensor(key)
+        except Exception:
+            return None
+        return None
+
+    def get_depth_gt(self: 'FileItemDTO'):
+        if not self.is_depth_cached:
+            return self.depth_gt
+        if self.depth_gt is None:
+            self.depth_gt = self._read_depth_key(self._depth_cache_path, self._depth_cache_key)
+        return self.depth_gt
+
+    def get_depth_gt_video(self: 'FileItemDTO'):
+        if not self.is_depth_video_cached:
+            return self.depth_gt_video
+        if self.depth_gt_video is None:
+            self.depth_gt_video = self._read_depth_key(
+                self._depth_video_cache_path, self._depth_video_cache_key
+            )
+        return self.depth_gt_video
+
+    def cleanup_depth(self: 'FileItemDTO'):
+        if self.is_depth_cached:
+            self.depth_gt = None
+        if self.is_depth_video_cached:
+            self.depth_gt_video = None
 
 
 class LatentCachingMixin:
