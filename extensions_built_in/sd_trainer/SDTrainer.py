@@ -169,6 +169,17 @@ class SDTrainer(BaseSDTrainProcess):
                 yield ds, file_list
 
     def _prime_perceptual_caches(self):
+        depth_roundtrip_fn = None
+        if getattr(self.sd, 'arch', None) == 'ideogram4':
+            def _ideogram_vae_roundtrip(arr: torch.Tensor) -> torch.Tensor:
+                vae_dtype = getattr(self.sd, 'vae_torch_dtype', get_torch_dtype(self.train_config.dtype))
+                img_m1 = (arr * 2.0 - 1.0).to(self.device_torch, dtype=vae_dtype)
+                latents = self.sd.encode_images(img_m1, device=self.device_torch, dtype=vae_dtype)
+                decoded = self.sd.decode_latents(latents, device=self.device_torch, dtype=vae_dtype)
+                return ((decoded.float() + 1.0) * 0.5).clamp(0, 1)
+
+            depth_roundtrip_fn = _ideogram_vae_roundtrip
+
         if self.subject_mask_config is not None and self.subject_mask_config.enabled:
             preview_dir = os.path.join(self.save_root, 'subject_mask_previews')
             for _ds, file_list in self._iter_dataset_file_lists():
@@ -196,7 +207,7 @@ class SDTrainer(BaseSDTrainProcess):
                 cache_depth_gt_embeddings(
                     file_list,
                     self.depth_consistency_config,
-                    vae_roundtrip_fn=None,
+                    vae_roundtrip_fn=depth_roundtrip_fn,
                     store_as_single_frame_video=False,
                 )
 
