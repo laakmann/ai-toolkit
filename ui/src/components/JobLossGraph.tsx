@@ -5,6 +5,7 @@ import useJobLossLog, { LossPoint } from '@/hooks/useJobLossLog';
 import { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
+import { openConfirm } from '@/components/ConfirmModal';
 
 interface Props {
   job: Job;
@@ -126,21 +127,18 @@ function hashToIndex(str: string, mod: number) {
   }
   return Math.abs(h) % mod;
 }
-
+// Hue order is deliberate: adjacent slots are maximally separated for
+// colorblind viewers, validated against the gray-950 chart surface.
 const PALETTE = [
-  'rgba(96,165,250,1)', // blue-400
-  'rgba(52,211,153,1)', // emerald-400
-  'rgba(167,139,250,1)', // purple-400
-  'rgba(251,191,36,1)', // amber-400
-  'rgba(244,114,182,1)', // pink-400
-  'rgba(248,113,113,1)', // red-400
-  'rgba(34,211,238,1)', // cyan-400
-  'rgba(129,140,248,1)', // indigo-400
+  'rgba(57,135,229,1)', // blue
+  'rgba(0,131,0,1)', // green
+  'rgba(213,81,129,1)', // magenta
+  'rgba(201,133,0,1)', // yellow
+  'rgba(25,158,112,1)', // aqua
+  'rgba(217,89,38,1)', // orange
+  'rgba(144,133,233,1)', // violet
+  'rgba(230,103,103,1)', // red
 ];
-
-function strokeForKey(key: string) {
-  return PALETTE[hashToIndex(key, PALETTE.length)];
-}
 
 // Persisted, per-URL graph settings. Sliders + display toggles + which loss
 // series are visible. Zoom / highlighted window is intentionally NOT persisted.
@@ -232,7 +230,7 @@ function formatLossKeyLabel(key: string): string {
 }
 
 export default function JobLossGraph({ job }: Props) {
-  const { series, lossKeys, status, refreshLoss } = useJobLossLog(job.id, 2000);
+  const { series, lossKeys, status, refreshLoss, deleteRange } = useJobLossLog(job.id, 2000);
 
   // Controls
   const [smoothingMode, setSmoothingMode] = useState<'ema' | 'ma'>('ema');
@@ -375,8 +373,9 @@ export default function JobLossGraph({ job }: Props) {
     });
   }, [lossKeys, showRawSeries, showAuxSeries, series]);
 
-  // keep enabled map in sync with discovered keys. Only "loss/loss" is on by
-  // default; every other metric starts deactivated (user can toggle it on).
+  // keep enabled map in sync with discovered keys. "loss/loss" and "val/loss"
+  // are on by default; every other metric starts deactivated (user can toggle
+  // it on).
   useEffect(() => {
     // Nothing discovered yet — don't prune, or we'd wipe a restored selection
     // before the keys have loaded.
@@ -384,7 +383,8 @@ export default function JobLossGraph({ job }: Props) {
     setEnabled(prev => {
       const next = { ...prev };
       for (const k of lossKeys) {
-        if (next[k] === undefined) next[k] = persistedEnabledRef.current?.[k] ?? k === 'loss/loss';
+        if (next[k] === undefined)
+          next[k] = persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss');
       }
       for (const k of Object.keys(next)) {
         if (!lossKeys.includes(k)) delete next[k];
@@ -394,6 +394,18 @@ export default function JobLossGraph({ job }: Props) {
   }, [lossKeys]);
 
   const activeKeys = useMemo(() => visibleLossKeys.filter(k => enabled[k] !== false), [visibleLossKeys, enabled]);
+
+  // Assign palette slots by position in the (sorted) lossKeys list rather than
+  // by hashing the key name — hashing let different keys collide onto the same
+  // color. Keyed off lossKeys (not activeKeys) so toggling a series off never
+  // repaints the others.
+  const colorByKey = useMemo(() => {
+    const m: Record<string, string> = {};
+    lossKeys.forEach((k, i) => {
+      m[k] = PALETTE[i % PALETTE.length];
+    });
+    return m;
+  }, [lossKeys]);
 
   // Build uPlot-aligned data + series configs.
   const built = useMemo(() => {
@@ -459,7 +471,7 @@ export default function JobLossGraph({ job }: Props) {
       const smooth = emaWithNulls(raw, emaAlpha);
       const trend = emaWithNulls(raw, trendAlpha);
 
-      const color = strokeForKey(key);
+      const color = colorByKey[key] ?? PALETTE[0];
       const colorDull = dulledColor(color);
 
       const visiblePointCount = raw.reduce<number>((n, v) => (v === null || !Number.isFinite(v) ? n : n + 1), 0);
@@ -730,6 +742,46 @@ export default function JobLossGraph({ job }: Props) {
     u.setScale('x', { min: xs[0], max: xs[xs.length - 1] });
   }, []);
 
+  const [deleting, setDeleting] = useState(false);
+
+  // Delete every logged step inside the current zoom window, then zoom back out.
+  const handleDeleteSelectedRange = useCallback(() => {
+    const u = uplotRef.current;
+    if (!u) return;
+    const xs = u.data[0] as number[];
+    if (!xs || !xs.length) return;
+    const sx = u.scales.x;
+    if (sx.min == null || sx.max == null) return;
+    // Snap the visible window to whole steps that actually fall inside it.
+    const minStep = Math.ceil(sx.min);
+    const maxStep = Math.floor(sx.max);
+    if (minStep > maxStep) return;
+    const count = xs.filter(x => x >= minStep && x <= maxStep).length;
+
+    openConfirm({
+      title: 'Delete Selected Range',
+      message: `Permanently delete steps ${minStep.toLocaleString()}–${maxStep.toLocaleString()} (${count.toLocaleString()} plotted points) from the loss log for all metrics? This cannot be undone.`,
+      type: 'danger',
+      confirmText: 'Delete',
+      onConfirm: async () => {
+        setDeleting(true);
+        try {
+          await deleteRange(minStep, maxStep);
+          // Zoom out: clear the zoom flag first so the data-update effect
+          // refits the x-scale to the remaining data instead of holding the
+          // old window.
+          isZoomedRef.current = false;
+          setIsZoomed(false);
+          handleResetZoom();
+        } catch (e) {
+          console.error('Error deleting loss range:', e);
+        } finally {
+          setDeleting(false);
+        }
+      },
+    });
+  }, [deleteRange, handleResetZoom]);
+
   const totalPoints = built.data[0]?.length ?? 0;
 
   return (
@@ -769,13 +821,23 @@ export default function JobLossGraph({ job }: Props) {
           ) : (
             <>
               {isZoomed && (
-                <button
-                  type="button"
-                  onClick={handleResetZoom}
-                  className="absolute top-2 right-2 z-10 px-2 py-1 rounded text-xs bg-blue-600/80 hover:bg-blue-600 text-white border border-blue-500/50"
-                >
-                  Reset zoom
-                </button>
+                <div className="absolute top-2 right-2 z-10 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDeleteSelectedRange}
+                    disabled={deleting}
+                    className="px-2 py-1 rounded text-xs bg-red-600/80 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white border border-red-500/50"
+                  >
+                    {deleting ? 'Deleting...' : 'Delete Selected Range'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleResetZoom}
+                    className="px-2 py-1 rounded text-xs bg-blue-600/80 hover:bg-blue-600 text-white border border-blue-500/50"
+                  >
+                    Reset zoom
+                  </button>
+                </div>
               )}
               <div ref={chartHostRef} className="absolute top-0 left-0 right-0 bottom-2 overflow-hidden">
                 <div ref={containerRef} />
@@ -840,7 +902,7 @@ export default function JobLossGraph({ job }: Props) {
                     aria-pressed={enabled[k] !== false}
                     title={k}
                   >
-                    <span className="inline-block h-2 w-2 rounded-full mr-2" style={{ background: strokeForKey(k) }} />
+                    <span className="inline-block h-2 w-2 rounded-full mr-2" style={{ background: colorByKey[k] }} />
                     {keyLabelByKey[k] ?? k}
                   </button>
                 ))}

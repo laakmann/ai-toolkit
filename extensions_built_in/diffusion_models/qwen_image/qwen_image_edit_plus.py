@@ -15,7 +15,6 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 )
 from toolkit.accelerator import get_accelerator, unwrap_model
 from optimum.quanto import freeze, QTensor
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
 import torch.nn.functional as F
 
 from diffusers import (
@@ -353,7 +352,6 @@ class QwenImageEditPlusModel(QwenImageModel):
             prompt_embeds_mask = text_embeddings.attention_mask.to(
                 self.device_torch, dtype=torch.int64
             )
-            txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
             enc_hs = text_embeddings.text_embeds.to(self.device_torch, self.torch_dtype)
 
         noise_pred = self.transformer(
@@ -365,7 +363,6 @@ class QwenImageEditPlusModel(QwenImageModel):
             encoder_hidden_states=enc_hs.detach(),
             encoder_hidden_states_mask=prompt_embeds_mask.detach(),
             img_shapes=img_shapes,
-            txt_seq_lens=txt_seq_lens,
             return_dict=False,
             **kwargs,
         )[0]
