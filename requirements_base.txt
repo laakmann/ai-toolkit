@@ -33,6 +33,14 @@ peft==0.18.1
 gradio
 python-slugify
 opencv-python
+insightface
+onnxruntime-gpu
+onnx2torch
+dsntnn
+ultralytics
+# Optional latent-space perceptual loss package used by ai-toolkit-perceptual.
+# Install explicitly if you enable latent_perceptual_loss_* settings.
+# elatentlpips
 pytorch-wavelets==1.3.0
 matplotlib==3.10.1
 setuptools>=77.0.3
