@@ -175,7 +175,45 @@ class SDTrainer(BaseSDTrainProcess):
             if file_list:
                 yield ds, file_list
 
+    def _is_ideogram_vae(self) -> bool:
+        return getattr(self.sd, 'arch', None) == 'ideogram4'
+
+    def _enable_ideogram_decoder_checkpointing(self):
+        dec = getattr(self.sd.vae, 'decoder', None)
+        if dec is None or getattr(dec, '_aitk_ckpt_patched', False):
+            return
+        import types
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        from toolkit.models.v2.vae.flux2_kl import swish as _swish
+
+        def fwd(self_dec, z):
+            z = self_dec.post_quant_conv(z)
+            upscale_dtype = next(self_dec.up.parameters()).dtype
+            h = self_dec.conv_in(z)
+            h = _ckpt(self_dec.mid.block_1, h, use_reentrant=False)
+            h = _ckpt(self_dec.mid.attn_1, h, use_reentrant=False)
+            h = _ckpt(self_dec.mid.block_2, h, use_reentrant=False)
+            h = h.to(upscale_dtype)
+            for i_level in reversed(range(self_dec.num_resolutions)):
+                for i_block in range(self_dec.num_res_blocks + 1):
+                    h = _ckpt(self_dec.up[i_level].block[i_block], h, use_reentrant=False)
+                    if len(self_dec.up[i_level].attn) > 0:
+                        h = _ckpt(self_dec.up[i_level].attn[i_block], h, use_reentrant=False)
+                if i_level != 0:
+                    h = self_dec.up[i_level].upsample(h)
+            h = self_dec.norm_out(h)
+            h = _swish(h)
+            h = self_dec.conv_out(h)
+            return h
+
+        dec.forward = types.MethodType(fwd, dec)
+        dec._aitk_ckpt_patched = True
+        print_acc("  Ideogram VAE decoder: per-block gradient checkpointing enabled")
+
     def _prime_perceptual_caches(self):
+        if self._is_ideogram_vae():
+            self._enable_ideogram_decoder_checkpointing()
+
         any_face_suppression = any(
             getattr(ds, 'face_suppression_weight', None) is not None
             for ds, _file_list in self._iter_dataset_file_lists()
