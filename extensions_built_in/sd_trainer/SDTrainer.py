@@ -27,7 +27,7 @@ from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
-from toolkit.depth_consistency import cache_depth_gt_embeddings, cache_video_depth_gt_embeddings, DifferentiableDepthEncoder, compute_depth_consistency_loss
+from toolkit.depth_consistency import cache_depth_gt_embeddings, cache_video_depth_gt_embeddings, DifferentiableDepthEncoder, compute_depth_consistency_loss, decode_wan_x0_to_frames, load_taehv_ltx2, load_taehv_wan21
 from toolkit.body_id import cache_body_proportion_embeddings, cache_video_body_proportion_embeddings, DifferentiableBodyProportionEncoder
 from toolkit.body_shape import cache_body_shape_embeddings, DifferentiableBodyShapeEncoder
 from toolkit.face_id import cache_face_embeddings, cache_video_identity_embeddings
@@ -119,6 +119,7 @@ class SDTrainer(BaseSDTrainProcess):
         self.normal_loss_model: Optional[DifferentiableNormalEncoder] = None
         self.latent_perceptual_model = None
         self._latent_perceptual_import_failed = False
+        self._video_perceptual_decoder = None
         self._dataset_series_key_by_id = {}
         self._dataset_sequence_by_series_key = {}
         self._dataset_label_by_series_key = {}
@@ -414,6 +415,46 @@ class SDTrainer(BaseSDTrainProcess):
         output = latents / self.sd.vae.config['scaling_factor']
         return self.sd.vae.decode(output).sample
 
+    def _get_video_perceptual_decoder(self):
+        if self._video_perceptual_decoder is not None:
+            return self._video_perceptual_decoder
+        arch = str(getattr(self.sd, 'arch', 'wan2.1'))
+        if arch.startswith('ltx'):
+            version = '2.3' if '2.3' in arch else '2.0'
+            self._video_perceptual_decoder = load_taehv_ltx2(
+                device=str(self.device_torch),
+                dtype=torch.bfloat16,
+                version=version,
+            )
+        else:
+            self._video_perceptual_decoder = load_taehv_wan21(
+                device=str(self.device_torch),
+                dtype=torch.bfloat16,
+            )
+        return self._video_perceptual_decoder
+
+    def _decode_video_latents_for_pixel_loss(self, latents: torch.Tensor) -> torch.Tensor:
+        if len(latents.shape) != 5:
+            raise ValueError(f"Expected 5D video latents, got shape {tuple(latents.shape)}")
+        if getattr(self.sd, 'arch', None) == 'ideogram4':
+            return self.sd.decode_latents(
+                latents,
+                device=self.device_torch,
+                dtype=get_torch_dtype(self.train_config.dtype),
+            )
+        decoder = self._get_video_perceptual_decoder()
+        return decode_wan_x0_to_frames(latents, decoder)
+
+    @staticmethod
+    def _align_temporal_length(seq: torch.Tensor, target_t: int) -> torch.Tensor:
+        if seq.shape[0] == target_t:
+            return seq
+        if target_t <= 0:
+            return seq[:0]
+        idx = torch.linspace(0, seq.shape[0] - 1, target_t, device=seq.device)
+        idx = torch.round(idx).long()
+        return seq[idx]
+
     @staticmethod
     def _has_positive_override(values) -> bool:
         if not values:
@@ -601,10 +642,14 @@ class SDTrainer(BaseSDTrainProcess):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if getattr(batch, 'file_items', None) is None or len(batch.file_items) == 0:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
-        if len(noise_pred.shape) != 4:
+        if len(noise_pred.shape) not in (4, 5):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
 
-        if self.identity_encoder is None and (cfg.identity_loss_weight > 0 or cfg.identity_metrics):
+        if self.identity_encoder is None and (
+            cfg.identity_loss_weight > 0
+            or cfg.identity_metrics
+            or self._has_positive_override(getattr(batch, 'identity_loss_weight_list', None))
+        ):
             self.identity_encoder = DifferentiableFaceEncoder(model_name=cfg.face_model)
             self.identity_encoder.to(self.device_torch)
             self.identity_encoder.eval()
@@ -624,13 +669,15 @@ class SDTrainer(BaseSDTrainProcess):
         cos_terms: List[torch.Tensor] = []
 
         for i, file_item in enumerate(batch.file_items):
-            ref_embed = getattr(file_item, 'identity_embedding', None)
-            if ref_embed is None:
-                continue
-            ref_embed = ref_embed.to(self.device_torch, dtype=torch.float32)
-            if ref_embed.dim() == 1:
-                ref_embed = ref_embed.unsqueeze(0)
-            ref_embed = torch.nn.functional.normalize(ref_embed, p=2, dim=-1)
+            ref_embed = None
+            if len(noise_pred.shape) == 4:
+                ref_embed = getattr(file_item, 'identity_embedding', None)
+                if ref_embed is None:
+                    continue
+                ref_embed = ref_embed.to(self.device_torch, dtype=torch.float32)
+                if ref_embed.dim() == 1:
+                    ref_embed = ref_embed.unsqueeze(0)
+                ref_embed = torch.nn.functional.normalize(ref_embed, p=2, dim=-1)
 
             min_t = cfg.identity_loss_min_t
             max_t = cfg.identity_loss_max_t
@@ -647,22 +694,71 @@ class SDTrainer(BaseSDTrainProcess):
             if t_ratio < min_t or t_ratio > max_t:
                 continue
 
-            x0_i = x0_pred[i:i + 1]
-            x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
-            x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
-            mapped_bbox = self._map_bbox_to_decoded_pixels(
-                file_item,
-                getattr(file_item, 'face_bbox', None),
-                int(x0_pixels.shape[-2]),
-                int(x0_pixels.shape[-1]),
-            )
+            if len(noise_pred.shape) == 5:
+                ref_video = getattr(file_item, 'identity_gt_video', None)
+                ref_bbox_video = getattr(file_item, 'identity_gt_video_bbox', None)
+                ref_valid_video = getattr(file_item, 'identity_gt_video_valid', None)
+                if ref_video is None or ref_valid_video is None:
+                    continue
+                x0_i = x0_pred[i:i + 1]
+                x0_pixels = self._decode_video_latents_for_pixel_loss(x0_i)
+                x0_pixels = x0_pixels.float().clamp(0, 1)
+                if len(x0_pixels.shape) != 5:
+                    continue
+                frames = x0_pixels[0].permute(1, 0, 2, 3).contiguous()  # (T, 3, H, W)
+                pred_t = frames.shape[0]
+                ref_video = self._align_temporal_length(ref_video.to(self.device_torch, dtype=torch.float32), pred_t)
+                ref_valid_video = self._align_temporal_length(ref_valid_video.to(self.device_torch, dtype=torch.float32), pred_t)
+                if ref_bbox_video is not None:
+                    ref_bbox_video = self._align_temporal_length(
+                        ref_bbox_video.to(self.device_torch, dtype=torch.float32), pred_t
+                    )
 
-            if self.identity_encoder is not None:
-                pred_embed = self.identity_encoder(x0_pixels, bboxes=[mapped_bbox]).to(torch.float32)
-                pred_embed = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
-                cos_sim = torch.nn.functional.cosine_similarity(pred_embed, ref_embed, dim=-1).mean()
+                valid_idx = torch.where(ref_valid_video > 0.5)[0]
+                if valid_idx.numel() == 0:
+                    continue
+                frames_v = frames[valid_idx]
+                ref_embed_v = torch.nn.functional.normalize(ref_video[valid_idx], p=2, dim=-1)
+                bboxes_v = None
+                if ref_bbox_video is not None:
+                    h_px = float(frames_v.shape[-2])
+                    w_px = float(frames_v.shape[-1])
+                    bboxes_v = []
+                    for j in valid_idx.tolist():
+                        bb = ref_bbox_video[j]
+                        if bb.abs().sum().item() <= 0:
+                            bboxes_v.append(None)
+                        else:
+                            bboxes_v.append([
+                                float(bb[0].item() * w_px),
+                                float(bb[1].item() * h_px),
+                                float(bb[2].item() * w_px),
+                                float(bb[3].item() * h_px),
+                            ])
+
+                if self.identity_encoder is not None:
+                    pred_embed = self.identity_encoder(frames_v, bboxes=bboxes_v).to(torch.float32)
+                    pred_embed = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
+                    cos_sim = torch.nn.functional.cosine_similarity(pred_embed, ref_embed_v, dim=-1).mean()
+                else:
+                    cos_sim = torch.tensor(0.0, device=self.device_torch, dtype=torch.float32)
             else:
-                cos_sim = torch.tensor(0.0, device=self.device_torch, dtype=torch.float32)
+                x0_i = x0_pred[i:i + 1]
+                x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
+                x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+                mapped_bbox = self._map_bbox_to_decoded_pixels(
+                    file_item,
+                    getattr(file_item, 'face_bbox', None),
+                    int(x0_pixels.shape[-2]),
+                    int(x0_pixels.shape[-1]),
+                )
+
+                if self.identity_encoder is not None:
+                    pred_embed = self.identity_encoder(x0_pixels, bboxes=[mapped_bbox]).to(torch.float32)
+                    pred_embed = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
+                    cos_sim = torch.nn.functional.cosine_similarity(pred_embed, ref_embed, dim=-1).mean()
+                else:
+                    cos_sim = torch.tensor(0.0, device=self.device_torch, dtype=torch.float32)
             cos_terms.append(cos_sim.detach())
 
             w = cfg.identity_loss_weight
@@ -979,9 +1075,13 @@ class SDTrainer(BaseSDTrainProcess):
             )
         ):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
-        if getattr(batch, 'body_proportion_embedding', None) is None:
+        has_image_gt = getattr(batch, 'body_proportion_embedding', None) is not None
+        has_video_gt = any(
+            getattr(fi, 'body_proportion_gt_video', None) is not None for fi in getattr(batch, 'file_items', [])
+        )
+        if not has_image_gt and not has_video_gt:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
-        if len(noise_pred.shape) != 4:
+        if len(noise_pred.shape) not in (4, 5):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
 
         if self.body_proportion_model is None:
@@ -1002,14 +1102,19 @@ class SDTrainer(BaseSDTrainProcess):
         total_loss = torch.zeros((), device=self.device_torch, dtype=torch.float32)
         used = 0
 
-        ref_bp = batch.body_proportion_embedding.to(self.device_torch, dtype=torch.float32)
-        for i in range(ref_bp.shape[0]):
-            packed = ref_bp[i]
-            if packed.abs().sum().item() <= 0:
-                continue
-            n = packed.shape[-1] // 2
-            ref_ratios = packed[:n].unsqueeze(0)
-            ref_vis = packed[n:].unsqueeze(0)
+        ref_bp = None
+        if len(noise_pred.shape) == 4 and getattr(batch, 'body_proportion_embedding', None) is not None:
+            ref_bp = batch.body_proportion_embedding.to(self.device_torch, dtype=torch.float32)
+        for i, file_item in enumerate(batch.file_items):
+            if len(noise_pred.shape) == 4:
+                if ref_bp is None or i >= ref_bp.shape[0]:
+                    continue
+                packed = ref_bp[i]
+                if packed.abs().sum().item() <= 0:
+                    continue
+                n = packed.shape[-1] // 2
+                ref_ratios = packed[:n].unsqueeze(0)
+                ref_vis = packed[n:].unsqueeze(0)
 
             w = cfg.body_proportion_loss_weight
             if hasattr(batch, 'body_proportion_loss_weight_list') and i < len(batch.body_proportion_loss_weight_list):
@@ -1035,20 +1140,56 @@ class SDTrainer(BaseSDTrainProcess):
                 continue
 
             x0_i = x0_pred[i:i + 1]
-            x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
-            x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
-            gen_ratios, gen_vis = self.body_proportion_model(
-                x0_pixels,
-                ref_ratios=ref_ratios,
-                include_head=getattr(cfg, 'body_proportion_include_head', False),
-            )
+            if len(noise_pred.shape) == 5:
+                ref_video = getattr(file_item, 'body_proportion_gt_video', None)
+                if ref_video is None:
+                    continue
+                ref_video = ref_video.to(self.device_torch, dtype=torch.float32)
+                if ref_video.dim() != 2 or ref_video.shape[0] == 0:
+                    continue
+                n = ref_video.shape[-1] // 2
+                if n <= 0:
+                    continue
 
-            vis = torch.min(ref_vis, gen_vis)
-            diff = (gen_ratios - ref_ratios).abs() * vis
-            base = diff.sum(dim=-1) / vis.sum(dim=-1).clamp(min=1e-6)
-            missing = (ref_vis >= 0.5) & (gen_vis < 0.2)
-            penalty = missing.float().sum(dim=-1) / (ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
-            sample_loss = (base + penalty).mean() * w
+                x0_pixels = self._decode_video_latents_for_pixel_loss(x0_i)
+                x0_pixels = x0_pixels.float().clamp(0, 1)
+                if len(x0_pixels.shape) != 5:
+                    continue
+                frames = x0_pixels[0].permute(1, 0, 2, 3).contiguous()  # (T, 3, H, W)
+                pred_t = frames.shape[0]
+                ref_video = self._align_temporal_length(ref_video, pred_t)
+                ref_ratios = ref_video[:, :n]
+                ref_vis = ref_video[:, n:]
+
+                gen_ratios, gen_vis = self.body_proportion_model(
+                    frames,
+                    ref_ratios=None,
+                    include_head=getattr(cfg, 'body_proportion_include_head', False),
+                )
+                vis = torch.min(ref_vis, gen_vis)
+                diff = (gen_ratios - ref_ratios).abs() * vis
+                base = diff.sum(dim=-1) / vis.sum(dim=-1).clamp(min=1e-6)
+                missing = (ref_vis >= 0.5) & (gen_vis < 0.2)
+                penalty = missing.float().sum(dim=-1) / (ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
+                frame_loss = base + penalty
+                valid_frame = (ref_vis.sum(dim=-1) > 0.01).float()
+                sample_loss = (frame_loss * valid_frame).sum() / valid_frame.sum().clamp(min=1.0)
+                sample_loss = sample_loss * w
+            else:
+                x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
+                x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+                gen_ratios, gen_vis = self.body_proportion_model(
+                    x0_pixels,
+                    ref_ratios=ref_ratios,
+                    include_head=getattr(cfg, 'body_proportion_include_head', False),
+                )
+
+                vis = torch.min(ref_vis, gen_vis)
+                diff = (gen_ratios - ref_ratios).abs() * vis
+                base = diff.sum(dim=-1) / vis.sum(dim=-1).clamp(min=1e-6)
+                missing = (ref_vis >= 0.5) & (gen_vis < 0.2)
+                penalty = missing.float().sum(dim=-1) / (ref_vis >= 0.5).float().sum(dim=-1).clamp(min=1.0)
+                sample_loss = (base + penalty).mean() * w
 
             total_loss = total_loss + sample_loss
             used += 1
