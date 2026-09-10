@@ -225,6 +225,30 @@ class SDTrainer(BaseSDTrainProcess):
             getattr(ds, 'face_suppression_weight', None) is not None
             for ds, _file_list in self._iter_dataset_file_lists()
         )
+        any_identity_override = any(
+            (getattr(ds, 'identity_loss_weight', None) or 0) > 0
+            for ds, _file_list in self._iter_dataset_file_lists()
+        )
+        any_landmark_override = any(
+            (getattr(ds, 'landmark_loss_weight', None) or 0) > 0
+            for ds, _file_list in self._iter_dataset_file_lists()
+        )
+        any_body_prop_override = any(
+            (getattr(ds, 'body_proportion_loss_weight', None) or 0) > 0
+            for ds, _file_list in self._iter_dataset_file_lists()
+        )
+        any_body_shape_override = any(
+            (getattr(ds, 'body_shape_loss_weight', None) or 0) > 0
+            for ds, _file_list in self._iter_dataset_file_lists()
+        )
+        any_normal_override = any(
+            (getattr(ds, 'normal_loss_weight', None) or 0) > 0
+            for ds, _file_list in self._iter_dataset_file_lists()
+        )
+        any_anchor_override = any(
+            (getattr(ds, 'vae_anchor_loss_weight', None) or 0) > 0
+            for ds, _file_list in self._iter_dataset_file_lists()
+        )
 
         depth_roundtrip_fn = None
         if getattr(self.sd, 'arch', None) == 'ideogram4':
@@ -250,24 +274,26 @@ class SDTrainer(BaseSDTrainProcess):
                 or face_cfg.landmark_loss_weight > 0
                 or face_cfg.identity_metrics
                 or any_face_suppression
+                or any_identity_override
+                or any_landmark_override
             )
             if need_face_cache:
                 for _ds, file_list in self._iter_dataset_file_lists():
                     cache_face_embeddings(file_list, face_cfg)
 
-            if face_cfg.vae_anchor_loss_weight > 0:
+            if face_cfg.vae_anchor_loss_weight > 0 or any_anchor_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
                     cache_vae_anchor_features(file_list, face_cfg)
 
-            if face_cfg.body_proportion_loss_weight > 0:
+            if face_cfg.body_proportion_loss_weight > 0 or any_body_prop_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
                     cache_body_proportion_embeddings(file_list, face_cfg)
 
-            if face_cfg.body_shape_loss_weight > 0:
+            if face_cfg.body_shape_loss_weight > 0 or any_body_shape_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
                     cache_body_shape_embeddings(file_list, face_cfg)
 
-            if face_cfg.normal_loss_weight > 0:
+            if face_cfg.normal_loss_weight > 0 or any_normal_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
                     cache_normal_embeddings(file_list, face_cfg)
 
