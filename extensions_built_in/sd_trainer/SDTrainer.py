@@ -14,7 +14,7 @@ from toolkit import train_tools
 from toolkit.bad_state_guard import BadStatePool
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig
+from toolkit.config_modules import GenerateImageConfig, FaceIDConfig, DepthConsistencyConfig, SubjectMaskConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.dto import DTO
@@ -72,6 +72,17 @@ class SDTrainer(BaseSDTrainProcess):
         if self.adapter_config is not None:
             if self.adapter_config.train:
                 self.do_grad_scale = False
+
+        face_id_raw = self.get_conf('face_id', None)
+        self.face_id_config: Optional[FaceIDConfig] = FaceIDConfig(**face_id_raw) if face_id_raw is not None else None
+        depth_consistency_raw = self.get_conf('depth_consistency', None)
+        self.depth_consistency_config: Optional[DepthConsistencyConfig] = (
+            DepthConsistencyConfig(**depth_consistency_raw) if depth_consistency_raw is not None else None
+        )
+        subject_mask_raw = self.get_conf('subject_mask', None)
+        self.subject_mask_config: Optional[SubjectMaskConfig] = (
+            SubjectMaskConfig(**subject_mask_raw) if subject_mask_raw is not None else None
+        )
 
         # if self.train_config.dtype in ["fp16", "float16"]:
         #     # patch the scaler to allow fp16 training

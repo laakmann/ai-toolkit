@@ -965,6 +965,94 @@ class SliderConfig:
 
 ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask', 'sapiens2_mask']
 
+
+class FaceIDConfig:
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.num_tokens: int = kwargs.get('num_tokens', 4)
+        self.dropout_prob: float = kwargs.get('dropout_prob', 0.1)
+        self.face_model: str = kwargs.get('face_model', 'buffalo_l')
+        self.scale_lr_multiplier: float = kwargs.get('scale_lr_multiplier', 10.0)
+        self.init_scale: float = kwargs.get('init_scale', 0.01)
+        self.vision_enabled: bool = kwargs.get('vision_enabled', False)
+        self.vision_model: str = kwargs.get('vision_model', 'openai/clip-vit-large-patch14')
+        self.vision_num_tokens: int = kwargs.get('vision_num_tokens', 4)
+        self.vision_crop_padding: float = kwargs.get('vision_crop_padding', 0.3)
+        self.identity_loss_weight: float = kwargs.get('identity_loss_weight', 0.0)
+        self.identity_loss_min_t: float = kwargs.get('identity_loss_min_t', 0.0)
+        self.identity_loss_max_t: float = kwargs.get('identity_loss_max_t', 1.0)
+        self.identity_loss_min_cos: float = kwargs.get('identity_loss_min_cos', 0.2)
+        self.identity_loss_use_average: bool = kwargs.get('identity_loss_use_average', True)
+        self.identity_loss_average_blend: float = kwargs.get('identity_loss_average_blend', 0.0)
+        self.identity_loss_use_random: bool = kwargs.get('identity_loss_use_random', False)
+        self.identity_loss_num_refs: int = kwargs.get('identity_loss_num_refs', 0)
+        self.identity_metrics: bool = kwargs.get('identity_metrics', False)
+        self.identity_loss_frames_per_chunk: int = kwargs.get('identity_loss_frames_per_chunk', 4)
+        self.identity_loss_preview_every: int = kwargs.get('identity_loss_preview_every', 0)
+        self.identity_loss_preview_max_keep: int = kwargs.get('identity_loss_preview_max_keep', 500)
+        self.identity_loss_decoded_det_threshold: float = kwargs.get('identity_loss_decoded_det_threshold', 0.5)
+        self.landmark_loss_weight: float = kwargs.get('landmark_loss_weight', 0.0)
+        self.body_proportion_loss_weight: float = kwargs.get('body_proportion_loss_weight', 0.0)
+        self.body_proportion_loss_min_t: float = kwargs.get('body_proportion_loss_min_t', 0.0)
+        self.body_proportion_loss_max_t: float = kwargs.get('body_proportion_loss_max_t', 1.0)
+        self.body_proportion_include_head: bool = kwargs.get('body_proportion_include_head', False)
+        self.body_proportion_frames_per_chunk: int = kwargs.get('body_proportion_frames_per_chunk', 2)
+        self.body_proportion_preview_every: int = kwargs.get('body_proportion_preview_every', 0)
+        self.body_shape_loss_weight: float = kwargs.get('body_shape_loss_weight', 0.0)
+        self.body_shape_loss_min_t: float = kwargs.get('body_shape_loss_min_t', 0.4)
+        self.body_shape_loss_max_t: float = kwargs.get('body_shape_loss_max_t', 0.8)
+        self.body_shape_loss_min_cos: float = kwargs.get('body_shape_loss_min_cos', 0.2)
+        self.normal_loss_weight: float = kwargs.get('normal_loss_weight', 0.0)
+        self.normal_loss_min_t: float = kwargs.get('normal_loss_min_t', 0.4)
+        self.normal_loss_max_t: float = kwargs.get('normal_loss_max_t', 0.8)
+        self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
+        self.face_suppression_expand: float = kwargs.get('face_suppression_expand', 2.0)
+        self.face_suppression_soft: bool = kwargs.get('face_suppression_soft', False)
+        self.vae_anchor_loss_weight: float = kwargs.get('vae_anchor_loss_weight', 0.0)
+        self.vae_anchor_loss_min_t: float = kwargs.get('vae_anchor_loss_min_t', 0.0)
+        self.vae_anchor_loss_max_t: float = kwargs.get('vae_anchor_loss_max_t', 0.5)
+        self.vae_anchor_model_path: str = kwargs.get('vae_anchor_model_path', '')
+
+
+class DepthConsistencyConfig:
+    def __init__(self, **kwargs):
+        self.loss_weight: float = kwargs.get('loss_weight', 0.1)
+        self.loss_min_t: float = kwargs.get('loss_min_t', 0.0)
+        self.loss_max_t: float = kwargs.get('loss_max_t', 1.0)
+        self.model_id: str = kwargs.get('model_id', 'depth-anything/Depth-Anything-V2-Small-hf')
+        self.input_size: int = kwargs.get('input_size', 518)
+        self.pixel_blur_sigma: float = kwargs.get('pixel_blur_sigma', 0.0)
+        self.ssi_weight: float = kwargs.get('ssi_weight', 1.0)
+        self.grad_weight: float = kwargs.get('grad_weight', 0.5)
+        self.grad_scales: int = kwargs.get('grad_scales', 4)
+        self.mask_source: str = kwargs.get('mask_source', 'subject')
+        self.grad_checkpoint: bool = kwargs.get('grad_checkpoint', True)
+        self.preview_every: int = kwargs.get('preview_every', 100)
+        self.preview_only: bool = kwargs.get('preview_only', False)
+        self.preview_min_t: float = kwargs.get('preview_min_t', 0.0)
+        self.preview_max_keep: int = kwargs.get('preview_max_keep', 500)
+        self.frames_per_chunk: int = kwargs.get('frames_per_chunk', 8)
+
+
+class SubjectMaskConfig:
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.yolo_ckpt: str = kwargs.get('yolo_ckpt', 'yolo11n.pt')
+        self.yolo_conf: float = kwargs.get('yolo_conf', 0.25)
+        self.primary_only: bool = kwargs.get('primary_only', True)
+        self.sam_size: str = kwargs.get('sam_size', 'small')
+        self.segformer_res: int = kwargs.get('segformer_res', 768)
+        self.cache_resolution: int = kwargs.get('cache_resolution', 256)
+        self.dtype: str = kwargs.get('dtype', 'fp16')
+        self.body_close_radius: int = kwargs.get('body_close_radius', 2)
+        self.mask_dilate_radius: int = kwargs.get('mask_dilate_radius', 0)
+        self.skin_bias: float = kwargs.get('skin_bias', 0.0)
+        self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
+        self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
+        self.body_loss_weight: Optional[float] = kwargs.get('body_loss_weight', None)
+        self.perceptual_restrict_to_body: bool = kwargs.get('perceptual_restrict_to_body', False)
+        self.save_debug_previews: bool = kwargs.get('save_debug_previews', False)
+
 class DatasetConfig:
     """
     Dataset config for sd-datasets
