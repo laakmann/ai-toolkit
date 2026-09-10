@@ -27,7 +27,7 @@ from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
-from toolkit.depth_consistency import cache_depth_gt_embeddings
+from toolkit.depth_consistency import cache_depth_gt_embeddings, DifferentiableDepthEncoder, compute_depth_consistency_loss
 from toolkit.face_id import cache_face_embeddings
 from toolkit.subject_mask import cache_subject_masks
 from toolkit.vae_anchor import cache_vae_anchor_features
@@ -105,6 +105,7 @@ class SDTrainer(BaseSDTrainProcess):
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         self.bad_state_pool: Optional[BadStatePool] = None
+        self.depth_encoder: Optional[DifferentiableDepthEncoder] = None
         self._dataset_series_key_by_id = {}
         self._dataset_sequence_by_series_key = {}
         self._dataset_label_by_series_key = {}
@@ -275,6 +276,96 @@ class SDTrainer(BaseSDTrainProcess):
             )
         output = latents / self.sd.vae.config['scaling_factor']
         return self.sd.vae.decode(output).sample
+
+    def _compute_depth_aux_loss(
+        self,
+        noise_pred: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: 'DataLoaderBatchDTO',
+    ) -> torch.Tensor:
+        cfg = self.depth_consistency_config
+        if cfg is None or (cfg.loss_weight <= 0 and not cfg.preview_only):
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if getattr(batch, 'file_items', None) is None or len(batch.file_items) == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+
+        if self.depth_encoder is None:
+            self.depth_encoder = DifferentiableDepthEncoder(
+                model_id=cfg.model_id,
+                input_size=cfg.input_size,
+                dtype=get_torch_dtype(self.train_config.dtype),
+                device=self.device_torch,
+                grad_checkpoint=cfg.grad_checkpoint,
+            )
+
+        if self.sd.x0_pred:
+            x0_pred = noise_pred
+        else:
+            tv = timesteps.to(noise_pred.device).to(noise_pred.dtype) / 1000.0
+            while len(tv.shape) < len(noise_pred.shape):
+                tv = tv.unsqueeze(-1)
+            tv = torch.clamp(tv, min=0.001)
+            x0_pred = noisy_latents - tv * noise_pred
+
+        total_steps = float(self.sd.noise_scheduler.config.num_train_timesteps)
+        total_loss = torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        used = 0
+
+        for i, file_item in enumerate(batch.file_items):
+            gt_depth = file_item.get_depth_gt() if hasattr(file_item, 'get_depth_gt') else None
+            if gt_depth is None:
+                continue
+
+            w = cfg.loss_weight
+            if hasattr(batch, 'depth_loss_weight_list') and i < len(batch.depth_loss_weight_list):
+                ds_w = batch.depth_loss_weight_list[i]
+                if ds_w is not None:
+                    w = float(ds_w)
+            if w <= 0:
+                continue
+
+            min_t = cfg.loss_min_t
+            max_t = cfg.loss_max_t
+            if hasattr(batch, 'depth_loss_min_t_list') and i < len(batch.depth_loss_min_t_list):
+                ds_min_t = batch.depth_loss_min_t_list[i]
+                if ds_min_t is not None:
+                    min_t = float(ds_min_t)
+            if hasattr(batch, 'depth_loss_max_t_list') and i < len(batch.depth_loss_max_t_list):
+                ds_max_t = batch.depth_loss_max_t_list[i]
+                if ds_max_t is not None:
+                    max_t = float(ds_max_t)
+
+            t_ratio = float(timesteps[i].detach().float().item() / total_steps)
+            if t_ratio < min_t or t_ratio > max_t:
+                continue
+
+            x0_i = x0_pred[i:i + 1]
+            x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
+            x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+            gt_i = gt_depth.to(self.device_torch)
+            if gt_i.dim() == 2:
+                gt_i = gt_i.unsqueeze(0)
+
+            loss_i, ssi_i, grad_i, _, _ = compute_depth_consistency_loss(
+                self.depth_encoder,
+                x0_pixels,
+                gt_i,
+                mask=None,
+                ssi_weight=cfg.ssi_weight,
+                grad_weight=cfg.grad_weight,
+                grad_scales=cfg.grad_scales,
+            )
+            total_loss = total_loss + (loss_i * w)
+            used += 1
+            self.additional_logs['loss/depth_consistency_ssi'] = float(ssi_i.item())
+            self.additional_logs['loss/depth_consistency_grad'] = float(grad_i.item())
+
+        if used == 0:
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        depth_loss = total_loss / float(used)
+        self.additional_logs['loss/depth_consistency'] = float(depth_loss.item())
+        return depth_loss
 
     def get_blank_control_image(self):
         # noise instead of a black image so the fallback does not read as a
@@ -1228,6 +1319,9 @@ class SDTrainer(BaseSDTrainProcess):
 
 
         loss = loss + additional_loss
+
+        depth_aux_loss = self._compute_depth_aux_loss(noise_pred, noisy_latents, timesteps, batch)
+        loss = loss + depth_aux_loss
         
         if hasattr(self.sd, "get_additional_loss"):
             additional_model_loss = self.sd.get_additional_loss(pred, target)
