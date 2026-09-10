@@ -1,0 +1,72 @@
+job: extension
+config:
+  name: "example_ideogram4_lora"
+  process:
+    - type: "sd_trainer"
+      training_folder: "output"
+      performance_log_every: 10
+      device: cuda:0
+      network:
+        type: "lokr"
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+      save:
+        dtype: bf16
+        save_every: 250
+        max_step_saves_to_keep: 8
+        save_format: diffusers
+      datasets:
+        - folder_path: datasets/your_dataset
+          caption_ext: txt
+          cache_latents_to_disk: true
+          resolution: [512, 768, 1024]
+          num_repeats: [16, 4, 1]
+          is_reg: false
+      train:
+        batch_size: 1
+        gradient_accumulation: 4
+        steps: 1200
+        gradient_checkpointing: true
+        train_unet: true
+        train_text_encoder: false
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        lr: 5e-5
+        dtype: bf16
+        bypass_guidance_embedding: false
+        max_grad_norm: 1.0
+        loss_type: mse
+        content_or_style: balanced
+        timestep_type: linear
+        # Per-step LoRA weight perturbation (ported from ai-toolkit-perceptual).
+        weight_noise:
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          log_every: 10
+          bound_norm: true
+      model:
+        name_or_path: "ideogram-ai/ideogram-4-fp8"
+        arch: ideogram4
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        low_vram: false
+        model_kwargs:
+          max_text_length: 3072
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 1024
+        height: 1024
+        guidance_scale: 4
+        sample_steps: 25
+        seed: 42
+        walk_seed: false
+        samples:
+          - prompt: "a photo of a person"
