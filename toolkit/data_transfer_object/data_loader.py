@@ -197,6 +197,7 @@ class FileItemDTO(
         self.identity_loss_min_t = getattr(self.dataset_config, 'identity_loss_min_t', None)
         self.identity_loss_max_t = getattr(self.dataset_config, 'identity_loss_max_t', None)
         self.identity_loss_min_cos = getattr(self.dataset_config, 'identity_loss_min_cos', None)
+        self.landmark_loss_weight = getattr(self.dataset_config, 'landmark_loss_weight', None)
         self.body_proportion_loss_weight = getattr(self.dataset_config, 'body_proportion_loss_weight', None)
         self.body_proportion_loss_min_t = getattr(self.dataset_config, 'body_proportion_loss_min_t', None)
         self.body_proportion_loss_max_t = getattr(self.dataset_config, 'body_proportion_loss_max_t', None)
@@ -386,6 +387,7 @@ class DataLoaderBatchDTO:
             self.identity_loss_min_t_list = [x.identity_loss_min_t for x in self.file_items]
             self.identity_loss_max_t_list = [x.identity_loss_max_t for x in self.file_items]
             self.identity_loss_min_cos_list = [x.identity_loss_min_cos for x in self.file_items]
+            self.landmark_loss_weight_list = [x.landmark_loss_weight for x in self.file_items]
             self.body_proportion_loss_weight_list = [x.body_proportion_loss_weight for x in self.file_items]
             self.body_proportion_loss_min_t_list = [x.body_proportion_loss_min_t for x in self.file_items]
             self.body_proportion_loss_max_t_list = [x.body_proportion_loss_max_t for x in self.file_items]

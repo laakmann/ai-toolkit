@@ -1197,6 +1197,7 @@ class DatasetConfig:
         self.identity_loss_min_t: Union[float, None] = kwargs.get('identity_loss_min_t', None)
         self.identity_loss_max_t: Union[float, None] = kwargs.get('identity_loss_max_t', None)
         self.identity_loss_min_cos: Union[float, None] = kwargs.get('identity_loss_min_cos', None)
+        self.landmark_loss_weight: Union[float, None] = kwargs.get('landmark_loss_weight', None)
         self.body_proportion_loss_weight: Union[float, None] = kwargs.get('body_proportion_loss_weight', None)
         self.body_proportion_loss_min_t: Union[float, None] = kwargs.get('body_proportion_loss_min_t', None)
         self.body_proportion_loss_max_t: Union[float, None] = kwargs.get('body_proportion_loss_max_t', None)

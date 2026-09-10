@@ -27,10 +27,10 @@ from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
-from toolkit.depth_consistency import cache_depth_gt_embeddings, DifferentiableDepthEncoder, compute_depth_consistency_loss
-from toolkit.body_id import cache_body_proportion_embeddings, DifferentiableBodyProportionEncoder
+from toolkit.depth_consistency import cache_depth_gt_embeddings, cache_video_depth_gt_embeddings, DifferentiableDepthEncoder, compute_depth_consistency_loss
+from toolkit.body_id import cache_body_proportion_embeddings, cache_video_body_proportion_embeddings, DifferentiableBodyProportionEncoder
 from toolkit.body_shape import cache_body_shape_embeddings, DifferentiableBodyShapeEncoder
-from toolkit.face_id import cache_face_embeddings
+from toolkit.face_id import cache_face_embeddings, cache_video_identity_embeddings
 from toolkit.subject_mask import cache_subject_masks
 from toolkit.face_id import DifferentiableFaceEncoder, DifferentiableLandmarkEncoder
 from toolkit.normal_id import cache_normal_embeddings, DifferentiableNormalEncoder
@@ -264,7 +264,9 @@ class SDTrainer(BaseSDTrainProcess):
         if self.subject_mask_config is not None and self.subject_mask_config.enabled:
             preview_dir = os.path.join(self.save_root, 'subject_mask_previews')
             for _ds, file_list in self._iter_dataset_file_lists():
-                cache_subject_masks(file_list, self.subject_mask_config, preview_dir=preview_dir)
+                still_items = [f for f in file_list if not getattr(f, 'is_video', False)]
+                if still_items:
+                    cache_subject_masks(still_items, self.subject_mask_config, preview_dir=preview_dir)
 
         if self.face_id_config is not None or any_face_suppression:
             face_cfg = self.face_id_config if self.face_id_config is not None else FaceIDConfig()
@@ -279,34 +281,73 @@ class SDTrainer(BaseSDTrainProcess):
             )
             if need_face_cache:
                 for _ds, file_list in self._iter_dataset_file_lists():
-                    cache_face_embeddings(file_list, face_cfg)
+                    still_items = [f for f in file_list if not getattr(f, 'is_video', False)]
+                    video_items = [f for f in file_list if getattr(f, 'is_video', False)]
+                    if still_items:
+                        cache_face_embeddings(still_items, face_cfg)
+                    if video_items and (face_cfg.identity_loss_weight > 0 or face_cfg.identity_metrics or any_identity_override):
+                        cache_video_identity_embeddings(
+                            video_items,
+                            face_cfg,
+                            device=self.device_torch,
+                            num_frames=None,
+                            arch=str(getattr(self.sd, 'arch', 'wan2.1')),
+                            include_images=False,
+                        )
 
             if face_cfg.vae_anchor_loss_weight > 0 or any_anchor_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
-                    cache_vae_anchor_features(file_list, face_cfg)
+                    still_items = [f for f in file_list if not getattr(f, 'is_video', False)]
+                    if still_items:
+                        cache_vae_anchor_features(still_items, face_cfg)
 
             if face_cfg.body_proportion_loss_weight > 0 or any_body_prop_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
-                    cache_body_proportion_embeddings(file_list, face_cfg)
+                    still_items = [f for f in file_list if not getattr(f, 'is_video', False)]
+                    video_items = [f for f in file_list if getattr(f, 'is_video', False)]
+                    if still_items:
+                        cache_body_proportion_embeddings(still_items, face_cfg)
+                    if video_items:
+                        cache_video_body_proportion_embeddings(
+                            video_items,
+                            face_cfg,
+                            device=self.device_torch,
+                            num_frames=None,
+                            include_images=False,
+                        )
 
             if face_cfg.body_shape_loss_weight > 0 or any_body_shape_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
-                    cache_body_shape_embeddings(file_list, face_cfg)
+                    still_items = [f for f in file_list if not getattr(f, 'is_video', False)]
+                    if still_items:
+                        cache_body_shape_embeddings(still_items, face_cfg)
 
             if face_cfg.normal_loss_weight > 0 or any_normal_override:
                 for _ds, file_list in self._iter_dataset_file_lists():
-                    cache_normal_embeddings(file_list, face_cfg)
+                    still_items = [f for f in file_list if not getattr(f, 'is_video', False)]
+                    if still_items:
+                        cache_normal_embeddings(still_items, face_cfg)
 
         if self.depth_consistency_config is not None and (
             self.depth_consistency_config.loss_weight > 0 or self.depth_consistency_config.preview_only
         ):
             for _ds, file_list in self._iter_dataset_file_lists():
-                cache_depth_gt_embeddings(
-                    file_list,
-                    self.depth_consistency_config,
-                    vae_roundtrip_fn=depth_roundtrip_fn,
-                    store_as_single_frame_video=False,
-                )
+                still_items = [f for f in file_list if not getattr(f, 'is_video', False)]
+                video_items = [f for f in file_list if getattr(f, 'is_video', False)]
+                if still_items:
+                    cache_depth_gt_embeddings(
+                        still_items,
+                        self.depth_consistency_config,
+                        vae_roundtrip_fn=depth_roundtrip_fn,
+                        store_as_single_frame_video=False,
+                    )
+                if video_items:
+                    cache_video_depth_gt_embeddings(
+                        video_items,
+                        self.depth_consistency_config,
+                        device=self.device_torch,
+                        num_frames=None,
+                    )
 
     @torch.no_grad()
     def _inject_weight_noise(self) -> None:
@@ -372,6 +413,68 @@ class SDTrainer(BaseSDTrainProcess):
             )
         output = latents / self.sd.vae.config['scaling_factor']
         return self.sd.vae.decode(output).sample
+
+    @staticmethod
+    def _has_positive_override(values) -> bool:
+        if not values:
+            return False
+        for v in values:
+            if v is not None and float(v) > 0:
+                return True
+        return False
+
+    def _map_bbox_to_decoded_pixels(self, file_item, bbox, out_h: int, out_w: int):
+        if bbox is None:
+            return None
+        try:
+            bbox_vals = bbox.tolist() if hasattr(bbox, 'tolist') else list(bbox)
+            x1, y1, x2, y2 = [float(v) for v in bbox_vals]
+        except Exception:
+            return None
+
+        src_w = float(getattr(file_item, 'width', 0) or 0)
+        src_h = float(getattr(file_item, 'height', 0) or 0)
+        if src_w <= 1.0 or src_h <= 1.0:
+            return None
+
+        if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+            x1, x2 = x1 * src_w, x2 * src_w
+            y1, y2 = y1 * src_h, y2 * src_h
+
+        if getattr(file_item, 'flip_x', False):
+            x1, x2 = src_w - x2, src_w - x1
+        if getattr(file_item, 'flip_y', False):
+            y1, y2 = src_h - y2, src_h - y1
+
+        scale_w = float(getattr(file_item, 'scale_to_width', src_w) or src_w)
+        scale_h = float(getattr(file_item, 'scale_to_height', src_h) or src_h)
+        x1 = x1 * (scale_w / src_w)
+        x2 = x2 * (scale_w / src_w)
+        y1 = y1 * (scale_h / src_h)
+        y2 = y2 * (scale_h / src_h)
+
+        crop_x = float(getattr(file_item, 'crop_x', 0) or 0)
+        crop_y = float(getattr(file_item, 'crop_y', 0) or 0)
+        crop_w = float(getattr(file_item, 'crop_width', scale_w) or scale_w)
+        crop_h = float(getattr(file_item, 'crop_height', scale_h) or scale_h)
+        if crop_w <= 1.0 or crop_h <= 1.0:
+            return None
+
+        x1 -= crop_x
+        x2 -= crop_x
+        y1 -= crop_y
+        y2 -= crop_y
+
+        x1 = max(0.0, min(crop_w, x1))
+        x2 = max(0.0, min(crop_w, x2))
+        y1 = max(0.0, min(crop_h, y1))
+        y2 = max(0.0, min(crop_h, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        sx = float(out_w) / crop_w
+        sy = float(out_h) / crop_h
+        return [x1 * sx, y1 * sy, x2 * sx, y2 * sy]
 
     def _compute_depth_aux_loss(
         self,
@@ -490,7 +593,11 @@ class SDTrainer(BaseSDTrainProcess):
         cfg = self.face_id_config
         if cfg is None:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
-        if cfg.identity_loss_weight <= 0 and not cfg.identity_metrics:
+        if (
+            cfg.identity_loss_weight <= 0
+            and not cfg.identity_metrics
+            and not self._has_positive_override(getattr(batch, 'identity_loss_weight_list', None))
+        ):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if getattr(batch, 'file_items', None) is None or len(batch.file_items) == 0:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
@@ -543,9 +650,15 @@ class SDTrainer(BaseSDTrainProcess):
             x0_i = x0_pred[i:i + 1]
             x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
             x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
+            mapped_bbox = self._map_bbox_to_decoded_pixels(
+                file_item,
+                getattr(file_item, 'face_bbox', None),
+                int(x0_pixels.shape[-2]),
+                int(x0_pixels.shape[-1]),
+            )
 
             if self.identity_encoder is not None:
-                pred_embed = self.identity_encoder(x0_pixels).to(torch.float32)
+                pred_embed = self.identity_encoder(x0_pixels, bboxes=[mapped_bbox]).to(torch.float32)
                 pred_embed = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
                 cos_sim = torch.nn.functional.cosine_similarity(pred_embed, ref_embed, dim=-1).mean()
             else:
@@ -715,25 +828,18 @@ class SDTrainer(BaseSDTrainProcess):
             fse = float(fse)
             fss = bool(fss)
 
-            src_w = float(getattr(file_item, 'crop_width', file_item.width) or file_item.width)
-            src_h = float(getattr(file_item, 'crop_height', file_item.height) or file_item.height)
-            if src_w <= 1 or src_h <= 1:
+            mapped_bbox = self._map_bbox_to_decoded_pixels(file_item, bbox, latent_h, latent_w)
+            if mapped_bbox is None:
                 continue
-
-            x1, y1, x2, y2 = [float(v) for v in bbox.tolist()]
+            x1, y1, x2, y2 = mapped_bbox
             cx = 0.5 * (x1 + x2)
             cy = 0.5 * (y1 + y2)
             bw = max(1.0, (x2 - x1) * fse)
             bh = max(1.0, (y2 - y1) * fse)
-            ex1 = max(0.0, cx - 0.5 * bw)
-            ey1 = max(0.0, cy - 0.5 * bh)
-            ex2 = min(src_w, cx + 0.5 * bw)
-            ey2 = min(src_h, cy + 0.5 * bh)
-
-            lx1 = int(max(0, min(latent_w, round(ex1 * latent_w / src_w))))
-            ly1 = int(max(0, min(latent_h, round(ey1 * latent_h / src_h))))
-            lx2 = int(max(0, min(latent_w, round(ex2 * latent_w / src_w))))
-            ly2 = int(max(0, min(latent_h, round(ey2 * latent_h / src_h))))
+            lx1 = int(max(0, min(latent_w, round(cx - 0.5 * bw))))
+            ly1 = int(max(0, min(latent_h, round(cy - 0.5 * bh))))
+            lx2 = int(max(0, min(latent_w, round(cx + 0.5 * bw))))
+            ly2 = int(max(0, min(latent_h, round(cy + 0.5 * bh))))
             if lx2 <= lx1 or ly2 <= ly1:
                 continue
 
@@ -865,7 +971,13 @@ class SDTrainer(BaseSDTrainProcess):
         batch: 'DataLoaderBatchDTO',
     ) -> torch.Tensor:
         cfg = self.face_id_config
-        if cfg is None or cfg.body_proportion_loss_weight <= 0:
+        if (
+            cfg is None
+            or (
+                cfg.body_proportion_loss_weight <= 0
+                and not self._has_positive_override(getattr(batch, 'body_proportion_loss_weight_list', None))
+            )
+        ):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if getattr(batch, 'body_proportion_embedding', None) is None:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
@@ -955,7 +1067,13 @@ class SDTrainer(BaseSDTrainProcess):
         batch: 'DataLoaderBatchDTO',
     ) -> torch.Tensor:
         cfg = self.face_id_config
-        if cfg is None or cfg.landmark_loss_weight <= 0:
+        if (
+            cfg is None
+            or (
+                cfg.landmark_loss_weight <= 0
+                and not self._has_positive_override(getattr(batch, 'landmark_loss_weight_list', None))
+            )
+        ):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if getattr(batch, 'landmark_embedding', None) is None:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
@@ -984,14 +1102,28 @@ class SDTrainer(BaseSDTrainProcess):
         for i in range(ref_landmarks.shape[0]):
             if ref_landmarks[i].abs().sum().item() <= 0:
                 continue
+            w = cfg.landmark_loss_weight
+            if hasattr(batch, 'landmark_loss_weight_list') and i < len(batch.landmark_loss_weight_list):
+                ds_w = batch.landmark_loss_weight_list[i]
+                if ds_w is not None:
+                    w = float(ds_w)
+            if w <= 0:
+                continue
             x0_i = x0_pred[i:i + 1]
             x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
             x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
-            bb = [bboxes[i]] if bboxes is not None and i < len(bboxes) else [None]
+            raw_bbox = bboxes[i] if bboxes is not None and i < len(bboxes) else None
+            mapped_bbox = self._map_bbox_to_decoded_pixels(
+                batch.file_items[i],
+                raw_bbox,
+                int(x0_pixels.shape[-2]),
+                int(x0_pixels.shape[-1]),
+            )
+            bb = [mapped_bbox]
             pred_lm = self.landmark_loss_model(x0_pixels, bboxes=bb)
             ref_lm = ref_landmarks[i:i + 1]
             lm_loss = torch.nn.functional.l1_loss(pred_lm.float(), ref_lm.float(), reduction='mean')
-            total_loss = total_loss + lm_loss * float(cfg.landmark_loss_weight)
+            total_loss = total_loss + lm_loss * w
             used += 1
 
         if used == 0:
@@ -1008,7 +1140,13 @@ class SDTrainer(BaseSDTrainProcess):
         batch: 'DataLoaderBatchDTO',
     ) -> torch.Tensor:
         cfg = self.face_id_config
-        if cfg is None or cfg.body_shape_loss_weight <= 0:
+        if (
+            cfg is None
+            or (
+                cfg.body_shape_loss_weight <= 0
+                and not self._has_positive_override(getattr(batch, 'body_shape_loss_weight_list', None))
+            )
+        ):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if getattr(batch, 'body_shape_embedding', None) is None:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
@@ -1062,8 +1200,14 @@ class SDTrainer(BaseSDTrainProcess):
             x0_i = x0_pred[i:i + 1]
             x0_pixels = self._decode_latents_for_pixel_loss(x0_i)
             x0_pixels = ((x0_pixels.float() + 1.0) * 0.5).clamp(0, 1)
-            bbox = [person_bboxes[i]] if person_bboxes is not None and i < len(person_bboxes) else None
-            pred = self.body_shape_model(x0_pixels, person_bboxes=bbox).to(torch.float32)
+            raw_bbox = person_bboxes[i] if person_bboxes is not None and i < len(person_bboxes) else None
+            mapped_bbox = self._map_bbox_to_decoded_pixels(
+                batch.file_items[i],
+                raw_bbox,
+                int(x0_pixels.shape[-2]),
+                int(x0_pixels.shape[-1]),
+            )
+            pred = self.body_shape_model(x0_pixels, person_bboxes=[mapped_bbox]).to(torch.float32)
             ref_i = ref[i:i + 1]
             pred = torch.nn.functional.normalize(pred, p=2, dim=-1)
             ref_i = torch.nn.functional.normalize(ref_i, p=2, dim=-1)
@@ -1087,7 +1231,13 @@ class SDTrainer(BaseSDTrainProcess):
         batch: 'DataLoaderBatchDTO',
     ) -> torch.Tensor:
         cfg = self.face_id_config
-        if cfg is None or cfg.normal_loss_weight <= 0:
+        if (
+            cfg is None
+            or (
+                cfg.normal_loss_weight <= 0
+                and not self._has_positive_override(getattr(batch, 'normal_loss_weight_list', None))
+            )
+        ):
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if getattr(batch, 'normal_embedding', None) is None:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
