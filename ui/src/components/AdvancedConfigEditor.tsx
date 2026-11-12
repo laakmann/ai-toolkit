@@ -4,11 +4,13 @@ import YAML from 'yaml';
 import Editor, { OnMount } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
 import { useTheme } from '@/components/ThemeProvider';
+import type { AuditIssue } from '@/app/jobs/new/audit';
 
 type Props<T> = {
   config: T;
   setConfig: (value: any, key?: string) => void;
   transformOnParse?: (parsed: any) => any;
+  issues?: AuditIssue[];
 };
 
 const yamlConfig: YAML.DocumentOptions &
@@ -35,10 +37,30 @@ function toYaml(obj: any): string {
   return doc.toString(yamlConfig);
 }
 
-export default function AdvancedConfigEditor<T>({ config, setConfig, transformOnParse }: Props<T>) {
+function pathToArray(path: string): (string | number)[] {
+  const parts: (string | number)[] = [];
+  const re = /([^[.\]]+)|\[(\d+)\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(path)) !== null) {
+    if (match[1] !== undefined) parts.push(match[1]);
+    else parts.push(Number(match[2]));
+  }
+  return parts;
+}
+
+function lineFromOffset(text: string, offset: number): number {
+  let line = 1;
+  for (let i = 0; i < offset && i < text.length; i += 1) {
+    if (text[i] === '\n') line += 1;
+  }
+  return line;
+}
+
+export default function AdvancedConfigEditor<T>({ config, setConfig, transformOnParse, issues = [] }: Props<T>) {
   const { theme } = useTheme();
   const [editorValue, setEditorValue] = useState<string>('');
   const [hasError, setHasError] = useState(false);
+  const [editorReady, setEditorReady] = useState(false);
   const lastConfigUpdateStringRef = useRef('');
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<any>(null);
@@ -51,6 +73,7 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
     editorRef.current = editor;
     monacoRef.current = monaco;
     isEditorMounted.current = true;
+    setEditorReady(true);
 
     // Model auto-detects indentation on creation; force 2 spaces
     editor.getModel()?.updateOptions({ tabSize: 2, insertSpaces: true });
@@ -103,6 +126,49 @@ export default function AdvancedConfigEditor<T>({ config, setConfig, transformOn
       console.warn(e);
     }
   }, [config]);
+
+  // Mirror the config audit issues as Monaco markers on the YAML keys.
+  useEffect(() => {
+    const monaco = monacoRef.current;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!monaco || !model || !editorReady) return;
+
+    const text = model.getValue();
+    let doc: any;
+    try {
+      doc = YAML.parseDocument(text);
+    } catch {
+      return;
+    }
+
+    const severity = {
+      error: monaco.MarkerSeverity.Error,
+      warning: monaco.MarkerSeverity.Warning,
+      info: monaco.MarkerSeverity.Info,
+    } as const;
+
+    const markers = issues.flatMap(issue => {
+      const raw = pathToArray(issue.path);
+      const segments = raw[0] === 'config' ? raw : ['config', 'process', 0, ...raw];
+      const node = doc.getIn(segments, true) as any;
+      const offset = node?.range?.[0];
+      if (typeof offset !== 'number') return [];
+      const line = lineFromOffset(text, offset);
+      return [
+        {
+          severity: severity[issue.severity],
+          message: `${issue.title}: ${issue.message}`,
+          startLineNumber: line,
+          startColumn: 1,
+          endLineNumber: line,
+          endColumn: model.getLineMaxColumn(line),
+        },
+      ];
+    });
+
+    monaco.editor.setModelMarkers(model, 'config-audit', markers);
+  }, [issues, editorReady]);
 
   const setMarkers = (errors: { message: string; line: number }[]) => {
     const monaco = monacoRef.current;

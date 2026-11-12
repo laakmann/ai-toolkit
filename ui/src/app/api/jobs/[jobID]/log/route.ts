@@ -31,7 +31,11 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   // small newline-counted tail would be mostly bar churn that collapses to a
   // few rendered lines — send a generous byte tail instead and let the
   // emulator (which caps its own scrollback) do the trimming.
-  const MAX_TAIL_BYTES = 5 * 1024 * 1024;
+  const MAX_TAIL_BYTES = 32 * 1024 * 1024;
+  // Explicit "Load full log" / download requests may read the whole file.
+  const MAX_FULL_BYTES = 256 * 1024 * 1024;
+  const wantsFull = request.nextUrl.searchParams.get('full') === '1';
+  const wantsDownload = request.nextUrl.searchParams.get('download') === '1';
   // Client sends the byte offset it has already consumed so we only return new
   // content. `offset` omitted (or NaN) => initial load / full tail.
   const offsetParam = request.nextUrl.searchParams.get('offset');
@@ -48,6 +52,26 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   try {
     const stats = await fs.promises.stat(logPath);
     const size = stats.size;
+
+    if (wantsDownload || wantsFull) {
+      if (size > MAX_FULL_BYTES) {
+        return NextResponse.json(
+          { error: `Log is too large to load fully (${(size / 1024 / 1024).toFixed(1)} MB).` },
+          { status: 413 },
+        );
+      }
+      const data = await fs.promises.readFile(logPath);
+      if (wantsDownload) {
+        return new NextResponse(new Uint8Array(data), {
+          headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Content-Disposition': `attachment; filename="${encodeURIComponent(job.name)}-log.txt"`,
+          },
+        });
+      }
+      return NextResponse.json({ log: data.toString('utf-8'), offset: size, reset: true });
+    }
+
     // If the client's offset is past the current end, the log was reset/truncated
     // (e.g. a fresh run overwrote it) — fall back to a fresh tail load.
     const isReset = Number.isNaN(offset) || offset > size;

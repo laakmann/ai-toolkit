@@ -13,7 +13,7 @@
 // cursor position and partial escape sequences across chunk boundaries.
 
 // Cap the scrollback so multi-day jobs don't grow memory without bound.
-const MAX_LINES = 5000;
+const MAX_LINES = 100_000;
 // If an escape sequence is never terminated, stop buffering it after this.
 const MAX_PENDING = 4096;
 

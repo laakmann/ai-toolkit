@@ -5,9 +5,11 @@ import GPUWidget from '@/components/GPUWidget';
 import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
 import { getTotalSteps } from '@/utils/jobs';
-import { Cpu, HardDrive, Info, Gauge } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Cpu, HardDrive, Info, Gauge, Download, Maximize2, Minimize2, Search, ArrowDownToLine, WrapText } from 'lucide-react';
+import { useMemo, useRef, useState } from 'react';
 import useJobLog from '@/hooks/useJobLog';
+import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
+import classNames from 'classnames';
 
 interface JobOverviewProps {
   job: Job;
@@ -20,11 +22,13 @@ export default function JobOverview({ job }: JobOverviewProps) {
     }
     return job.gpu_ids.split(',').map(id => parseInt(id));
   }, [job.gpu_ids]);
-  const { log, status: statusLog, refresh: refreshLog } = useJobLog(job.id, 2000);
-  const logRef = useRef<HTMLDivElement>(null);
-  // Track whether we should auto-scroll to bottom
-  const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
-  console.log('job.gpu_ids', job.gpu_ids);
+  const { log, status: statusLog, loadFull } = useJobLog(job.id, 2000);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const [followLog, setFollowLog] = useState(true);
+  const [logSearch, setLogSearch] = useState('');
+  const [logWrap, setLogWrap] = useState(false);
+  const [logMaximized, setLogMaximized] = useState(false);
+  const [loadingFullLog, setLoadingFullLog] = useState(false);
   const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
@@ -33,33 +37,32 @@ export default function JobOverview({ job }: JobOverviewProps) {
 
   const logLines: string[] = useMemo(() => {
     // Log is already terminal-rendered by useJobLog — one entry per line.
-    let splits: string[] = log.split('\n');
-
-    // only return last 100 lines max
-    const maxLines = 1000;
-    if (splits.length > maxLines) {
-      splits = splits.slice(splits.length - maxLines);
-    }
-
-    return splits;
+    if (log === '') return [];
+    return log.split('\n');
   }, [log]);
 
-  // Handle scroll events to determine if user has scrolled away from bottom
-  const handleScroll = () => {
-    if (logRef.current) {
-      const { scrollTop, scrollHeight, clientHeight } = logRef.current;
-      // Consider "at bottom" if within 10 pixels of the bottom
-      const isAtBottom = scrollHeight - scrollTop - clientHeight < 10;
-      setIsScrolledToBottom(isAtBottom);
-    }
+  const filteredLogLines = useMemo(() => {
+    const query = logSearch.trim().toLowerCase();
+    if (!query) return logLines;
+    return logLines.filter(line => line.toLowerCase().includes(query));
+  }, [logLines, logSearch]);
+
+  const jumpToLogBottom = () => {
+    if (filteredLogLines.length === 0) return;
+    setFollowLog(true);
+    virtuosoRef.current?.scrollToIndex({ index: filteredLogLines.length - 1, behavior: 'smooth' });
   };
 
-  // Auto-scroll to bottom only if we were already at the bottom
-  useEffect(() => {
-    if (logRef.current && isScrolledToBottom) {
-      logRef.current.scrollTop = logRef.current.scrollHeight;
+  const handleLoadFullLog = async () => {
+    if (loadingFullLog) return;
+    setLoadingFullLog(true);
+    try {
+      await loadFull();
+      setFollowLog(true);
+    } finally {
+      setLoadingFullLog(false);
     }
-  }, [log, isScrolledToBottom]);
+  };
 
   const getStatusColor = (status: string) => {
     switch (status.toLowerCase()) {
@@ -139,22 +142,111 @@ export default function JobOverview({ job }: JobOverviewProps) {
             </div>
           </div>
 
-          {/* Log - Now using flex-grow to fill remaining space */}
-          <div className="bg-gray-950 rounded-lg p-4 relative flex-grow min-h-60">
-            <div
-              ref={logRef}
-              className="text-xs text-gray-300 absolute inset-0 p-4 overflow-y-auto"
-              onScroll={handleScroll}
-            >
-              {statusLog === 'loading' && 'Loading log...'}
-              {statusLog === 'error' && 'Error loading log'}
-              {['success', 'refreshing'].includes(statusLog) && (
-                <div>
-                  {logLines.map((line, index) => {
-                    return <pre key={index}>{line}</pre>;
-                  })}
+          {/* Log viewer */}
+          <div
+            className={classNames(
+              'bg-gray-950 rounded-lg flex flex-col',
+              logMaximized ? 'fixed inset-0 z-40 p-3 sm:p-5' : 'relative flex-grow min-h-[420px] h-[65vh] p-2',
+            )}
+          >
+            <div className="flex flex-wrap items-center gap-1.5 pb-2">
+              <div className="relative min-w-[140px] flex-1">
+                <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-500" />
+                <input
+                  value={logSearch}
+                  onChange={event => setLogSearch(event.target.value)}
+                  placeholder="Filter log..."
+                  className="w-full rounded border border-gray-700 bg-gray-900 py-1 pl-7 pr-2 text-xs text-gray-200 placeholder:text-gray-500 focus:border-transparent focus:ring-2 focus:ring-gray-600"
+                />
+              </div>
+              <span className="whitespace-nowrap text-[10px] text-gray-500">
+                {filteredLogLines.length.toLocaleString()} / {logLines.length.toLocaleString()} lines
+              </span>
+              <button
+                type="button"
+                onClick={handleLoadFullLog}
+                disabled={loadingFullLog}
+                className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+                title="Load the entire log file"
+              >
+                <ArrowDownToLine className="h-3.5 w-3.5" />
+                {loadingFullLog ? 'Loading...' : 'Load full log'}
+              </button>
+              <a
+                href={`/api/jobs/${job.id}/log?download=1`}
+                className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:bg-gray-800"
+                title="Download the full log file"
+              >
+                <Download className="h-3.5 w-3.5" />
+                Download
+              </a>
+              <button
+                type="button"
+                onClick={() => setLogWrap(value => !value)}
+                className={classNames(
+                  'flex items-center gap-1 rounded border px-2 py-1 text-[10px]',
+                  logWrap
+                    ? 'border-sky-500/50 bg-sky-500/10 text-sky-300'
+                    : 'border-gray-700 text-gray-300 hover:bg-gray-800',
+                )}
+                title="Toggle line wrapping"
+              >
+                <WrapText className="h-3.5 w-3.5" />
+                Wrap
+              </button>
+              <button
+                type="button"
+                onClick={jumpToLogBottom}
+                className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:bg-gray-800"
+                title="Jump to the newest line"
+              >
+                <ArrowDownToLine className="h-3.5 w-3.5" />
+                Bottom
+              </button>
+              <button
+                type="button"
+                onClick={() => setLogMaximized(value => !value)}
+                className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 hover:bg-gray-800"
+                title={logMaximized ? 'Restore log panel' : 'Maximize log panel'}
+              >
+                {logMaximized ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+
+            <div className="relative min-h-0 flex-1 overflow-hidden rounded border border-gray-800">
+              {statusLog === 'loading' && (
+                <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-500">Loading log...</div>
+              )}
+              {statusLog === 'error' && (
+                <div className="absolute inset-0 flex items-center justify-center text-xs text-rose-400">
+                  Error loading log
                 </div>
               )}
+              {['success', 'refreshing'].includes(statusLog) && filteredLogLines.length === 0 ? (
+                <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-500">
+                  {logSearch ? 'No lines match the filter.' : 'No log output yet.'}
+                </div>
+              ) : null}
+              {['success', 'refreshing'].includes(statusLog) && filteredLogLines.length > 0 ? (
+                <Virtuoso
+                  ref={virtuosoRef}
+                  style={{ height: '100%' }}
+                  data={filteredLogLines}
+                  followOutput={followLog ? 'smooth' : false}
+                  atBottomStateChange={atBottom => setFollowLog(atBottom)}
+                  increaseViewportBy={500}
+                  itemContent={(index, line) => (
+                    <pre
+                      className={classNames(
+                        'px-2 text-xs text-gray-300',
+                        logWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre',
+                      )}
+                    >
+                      {line || ' '}
+                    </pre>
+                  )}
+                />
+              ) : null}
             </div>
           </div>
         </div>

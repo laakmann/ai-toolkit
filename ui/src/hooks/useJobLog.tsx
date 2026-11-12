@@ -26,6 +26,8 @@ export default function useJobLog(jobID: string, reloadInterval: null | number =
   // still in flight, both would read the same offset and append the same
   // bytes twice.
   const inFlightRef = useRef(false);
+  // One-shot request for the entire log file instead of the bounded tail.
+  const fullLoadRef = useRef(false);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error' | 'refreshing'>('idle');
 
   const refresh = () => {
@@ -39,8 +41,14 @@ export default function useJobLog(jobID: string, reloadInterval: null | number =
     }
     setStatus(loadStatus);
     const offset = offsetRef.current;
+    const params: Record<string, string | number> = {};
+    if (fullLoadRef.current) {
+      params.full = 1;
+    } else if (offset !== null) {
+      params.offset = offset;
+    }
     return apiClient
-      .get(`/api/jobs/${jobID}/log`, offset !== null ? { params: { offset } } : undefined)
+      .get(`/api/jobs/${jobID}/log`, Object.keys(params).length > 0 ? { params } : undefined)
       .then(res => res.data)
       .then(data => {
         offsetRef.current = data.offset ?? null;
@@ -53,6 +61,9 @@ export default function useJobLog(jobID: string, reloadInterval: null | number =
         setLog(terminal.toString());
         setStatus('success');
         didInitialLoadRef.current = true;
+        if (fullLoadRef.current) {
+          fullLoadRef.current = false;
+        }
       })
       .catch(error => {
         console.error('Error fetching log:', error);
@@ -69,11 +80,19 @@ export default function useJobLog(jobID: string, reloadInterval: null | number =
     offsetRef.current = null;
     didInitialLoadRef.current = false;
     inFlightRef.current = false;
+    fullLoadRef.current = false;
     terminalRef.current?.reset();
     setLog('');
   }, [jobID]);
 
   usePollLoop(refresh, reloadInterval, [jobID]);
 
-  return { log, status, refresh };
+  const loadFull = () => {
+    fullLoadRef.current = true;
+    offsetRef.current = null;
+    didInitialLoadRef.current = false;
+    return refresh();
+  };
+
+  return { log, status, refresh, loadFull };
 }

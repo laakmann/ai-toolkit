@@ -18,10 +18,22 @@ from typing import List, Optional, Sequence
 import torch
 
 __all__ = [
+    "FIXED_STEP_TIMESTEP_TYPES",
+    "timestep_weights_supported",
     "validate_timestep_weights",
     "build_quantile_pmf",
     "sample_timestep_indices",
 ]
+
+# These timestep modes choose an exact, small set of indices. Sampling weights
+# over the full schedule would silently replace that schedule, so the trainer
+# ignores weights for them.
+FIXED_STEP_TIMESTEP_TYPES = frozenset({"one_step", "two_step", "four_step", "eight_step"})
+
+
+def timestep_weights_supported(timestep_type: str) -> bool:
+    """Return whether ``timestep_weights`` can bias this timestep mode."""
+    return timestep_type not in FIXED_STEP_TIMESTEP_TYPES
 
 
 def validate_timestep_weights(

@@ -132,7 +132,42 @@ export interface DatasetConfig {
   flip_x: boolean;
   flip_y: boolean;
   num_repeats?: number;
+  buckets?: boolean;
+  cache_latents?: boolean;
+  augmentations?: { [key: string]: any }[] | null;
+  timestep_type?: string | null;
+  min_denoising_steps?: number | null;
+  max_denoising_steps?: number | null;
   timestep_weights?: number[] | null;
+  diffusion_loss_weight?: number;
+  depth_loss_weight?: number;
+  depth_loss_min_t?: number;
+  depth_loss_max_t?: number;
+  identity_loss_weight?: number;
+  identity_loss_min_t?: number;
+  identity_loss_max_t?: number;
+  identity_loss_min_cos?: number;
+  landmark_loss_weight?: number;
+  body_proportion_loss_weight?: number;
+  body_proportion_loss_min_t?: number;
+  body_proportion_loss_max_t?: number;
+  body_shape_loss_weight?: number;
+  body_shape_loss_min_t?: number;
+  body_shape_loss_max_t?: number;
+  normal_loss_weight?: number;
+  normal_loss_min_t?: number;
+  normal_loss_max_t?: number;
+  vae_anchor_loss_weight?: number;
+  vae_anchor_loss_min_t?: number;
+  vae_anchor_loss_max_t?: number;
+  face_suppression_weight?: number;
+  face_suppression_expand?: number;
+  face_suppression_soft?: boolean;
+  latent_perceptual_loss_weight?: number;
+  latent_perceptual_loss_min_t?: number;
+  latent_perceptual_loss_max_t?: number;
+  perceptual_restrict_to_body?: boolean;
+  loss_split?: 'diffusion_depth' | 'sum' | null;
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
@@ -167,6 +202,14 @@ export interface TrainConfig {
   noise_scheduler: string;
   timestep_type: string;
   content_or_style: string;
+  min_denoising_steps?: number;
+  max_denoising_steps?: number;
+  num_train_timesteps?: number;
+  first_timestep_chance?: number;
+  latent_perceptual_loss_weight?: number;
+  latent_perceptual_loss_min_t?: number;
+  latent_perceptual_loss_max_t?: number;
+  loss_split?: 'diffusion_depth' | 'sum' | null;
   optimizer: string;
   lr: number;
   ema_config?: EMAConfig;
@@ -289,6 +332,9 @@ export interface ProcessConfig {
   logging: LoggingConfig;
   model: ModelConfig;
   sample: SampleConfig;
+  face_id?: { [key: string]: any };
+  depth_consistency?: { [key: string]: any };
+  subject_mask?: { [key: string]: any };
 }
 
 export interface ConfigObject {

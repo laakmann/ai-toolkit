@@ -33,6 +33,23 @@ There are two levels of config:
 
 Dataset-level values override global values for that dataset.
 
+### In the web UI
+
+- Each dataset card now has a **Timestep Overrides** section for `timestep_type`,
+  `min_denoising_steps`, `max_denoising_steps`, and `timestep_weights`.
+- Each dataset card also has **Auxiliary Loss Overrides** for the perceptual
+  loss weights and their timestep ranges. Empty fields inherit the global value;
+  setting a weight to `0` disables that loss for the dataset.
+- The global **Auxiliary Losses** card holds the defaults (`face_id`,
+  `depth_consistency`, `train.latent_perceptual_loss_*`, subject masks, and
+  `loss_split`).
+- **Config Check** in the top bar lists errors, warnings, and unused options.
+  Errors block **Create Job**; warnings are advisory. The advanced YAML editor
+  shows the same issues as Monaco markers.
+- Timestep weights are ignored for fixed-step modes (`one_step`, `two_step`,
+  `four_step`, `eight_step`); the UI disables them and the trainer logs a
+  warning if they are set in advanced config.
+
 ## Mixed Mode: Normal + Perceptual In One Run
 
 Recommended pattern:

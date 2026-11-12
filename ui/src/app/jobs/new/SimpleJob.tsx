@@ -28,7 +28,9 @@ import { openUpsamplePromptsModal, toAspectRatio } from '@/components/UpsamplePr
 import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
-import TimestepWeightsInput from '@/components/TimestepWeightsInput';
+import DatasetTrainingSection from '@/components/DatasetTrainingSection';
+import AuxiliaryLossSettings from '@/components/AuxiliaryLossSettings';
+import type { AuditIssue } from './audit';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
@@ -46,6 +48,7 @@ type Props = {
   gpuList: any;
   datasetOptions: any;
   datasetStatsByPath?: Record<string, DatasetStats>;
+  issues?: AuditIssue[];
   isLoading?: boolean;
 };
 
@@ -62,6 +65,7 @@ export default function SimpleJob({
   gpuList,
   datasetOptions,
   datasetStatsByPath,
+  issues = [],
   isLoading,
 }: Props) {
   const { archs: modelArchs, groupedModelOptions } = useModelArchs();
@@ -712,7 +716,7 @@ export default function SimpleJob({
             />
           </Card>
         </div>
-        <div>
+        <div data-audit-target="training">
           <Card title="Training">
             <div className={trainingBarClass}>
               <div>
@@ -1000,6 +1004,17 @@ export default function SimpleJob({
             </div>
           </Card>
         </div>
+        <div data-audit-target="aux">
+          <Card title="Auxiliary Losses" collapsible defaultOpen={false}>
+            <AuxiliaryLossSettings
+              train={jobConfig.config.process[0].train}
+              processConfig={jobConfig.config.process[0]}
+              setJobConfig={setJobConfig}
+              disabled={isLoading}
+              issues={issues}
+            />
+          </Card>
+        </div>
         <div>
           {!isLlmModel && (
             <Card
@@ -1184,11 +1199,11 @@ export default function SimpleJob({
             </Card>
           )}
         </div>
-        <div>
+        <div data-audit-target="datasets">
           <Card title="Datasets">
             <>
               {jobConfig.config.process[0].datasets.map((dataset, i) => (
-                <div key={i} className="p-4 rounded-lg bg-gray-800 relative">
+                <div key={i} className="p-4 rounded-lg bg-gray-800 relative" data-audit-target={`dataset-${i}`}>
                   <div className="absolute top-2 right-2 flex gap-1">
                     <button
                       type="button"
@@ -1345,11 +1360,6 @@ export default function SimpleJob({
                         placeholder={`${jobConfig.config.process[0].train.batch_size}`}
                         min={1}
                         allowEmpty
-                      />
-                      <TimestepWeightsInput
-                        value={dataset.timestep_weights}
-                        className="pt-2"
-                        onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].timestep_weights`)}
                       />
                     </div>
                     <div>
@@ -1519,6 +1529,15 @@ export default function SimpleJob({
                       </div>
                     )}
                   </div>
+                  <DatasetTrainingSection
+                    dataset={dataset}
+                    index={i}
+                    train={jobConfig.config.process[0].train}
+                    processConfig={jobConfig.config.process[0]}
+                    setJobConfig={setJobConfig}
+                    issues={issues}
+                    disabled={isLoading}
+                  />
                 </div>
               ))}
               <button

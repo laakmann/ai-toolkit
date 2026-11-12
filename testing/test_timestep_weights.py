@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from toolkit.timestep_weighing.quantile_weights import (
     build_quantile_pmf,
     sample_timestep_indices,
+    timestep_weights_supported,
     validate_timestep_weights,
 )
 
@@ -54,6 +55,14 @@ def test_validate_rejects_bad_lists():
             continue
         raise AssertionError(f"expected ValueError for {value!r}")
     print("  PASS test_validate_rejects_bad_lists")
+
+
+def test_fixed_step_modes_ignore_weights():
+    for timestep_type in ("one_step", "two_step", "four_step", "eight_step"):
+        assert timestep_weights_supported(timestep_type) is False
+    for timestep_type in ("linear", "sigmoid", "shift", "weighted", "next_sample"):
+        assert timestep_weights_supported(timestep_type) is True
+    print("  PASS test_fixed_step_modes_ignore_weights")
 
 
 # ============================================================
@@ -169,6 +178,7 @@ if __name__ == "__main__":
     print("\n=== Validation ===")
     test_validate_accepts_none_and_valid_lists()
     test_validate_rejects_bad_lists()
+    test_fixed_step_modes_ignore_weights()
 
     print("\n=== Quantile PMF ===")
     test_uniform_weights_produce_uniform_pmf()

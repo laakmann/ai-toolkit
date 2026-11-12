@@ -21,6 +21,9 @@ import SimpleJob from './SimpleJob';
 import AdvancedConfigEditor from '@/components/AdvancedConfigEditor';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
+import { useModelArchs } from '@/extensions/modelArchs';
+import { auditJobConfig, countIssues } from './audit';
+import ConfigAuditPanel, { ConfigAuditButton } from '@/components/ConfigAuditPanel';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -39,6 +42,13 @@ export default function TrainingForm() {
 
   const [jobConfig, setJobConfig] = useNestedState<JobConfig>(objectCopy(migrateJobConfig(defaultJobConfig)));
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
+  const [showAudit, setShowAudit] = useState(false);
+  const { archs: modelArchs } = useModelArchs();
+  const modelArch = useMemo(() => {
+    return modelArchs.find(arch => arch.name === jobConfig.config.process?.[0]?.model?.arch);
+  }, [modelArchs, jobConfig.config.process?.[0]?.model?.arch]);
+  const auditIssues = useMemo(() => auditJobConfig({ config: jobConfig, arch: modelArch }), [jobConfig, modelArch]);
+  const auditCounts = useMemo(() => countIssues(auditIssues), [auditIssues]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleImportConfig = () => {
@@ -162,6 +172,10 @@ export default function TrainingForm() {
 
   const saveJob = async () => {
     if (status === 'saving') return;
+    if (auditCounts.error > 0) {
+      setShowAudit(true);
+      return;
+    }
     setStatus('saving');
 
     apiClient
@@ -199,6 +213,14 @@ export default function TrainingForm() {
     saveJob();
   };
 
+  const jumpToAuditTarget = (target: string) => {
+    setShowAudit(false);
+    requestAnimationFrame(() => {
+      const element = document.querySelector(`[data-audit-target="${target}"]`);
+      element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  };
+
   return (
     <>
       <TopBar>
@@ -213,6 +235,9 @@ export default function TrainingForm() {
           </h1>
         </div>
         <div className="flex-1"></div>
+        <div className="flex-shrink-0 pr-1 sm:pr-2">
+          <ConfigAuditButton issues={auditIssues} onClick={() => setShowAudit(true)} />
+        </div>
         {showAdvancedView && (
           <>
             <div className="hidden sm:block">
@@ -304,6 +329,7 @@ export default function TrainingForm() {
           <AdvancedConfigEditor
             config={jobConfig}
             setConfig={setJobConfig}
+            issues={auditIssues}
             transformOnParse={(parsed: any) => {
               try {
                 parsed.config.process[0].sqlite_db_path = './aitk_db.db';
@@ -337,6 +363,7 @@ export default function TrainingForm() {
               gpuList={gpuList}
               datasetOptions={datasetOptions}
               datasetStatsByPath={datasetStatsByPath}
+              issues={auditIssues}
               isLoading={
                 !isSettingsLoaded ||
                 !isGPUInfoLoaded ||
@@ -349,6 +376,13 @@ export default function TrainingForm() {
           <div className="pt-20"></div>
         </MainContent>
       )}
+
+      <ConfigAuditPanel
+        isOpen={showAudit}
+        onClose={() => setShowAudit(false)}
+        issues={auditIssues}
+        onJump={jumpToAuditTarget}
+      />
     </>
   );
 }

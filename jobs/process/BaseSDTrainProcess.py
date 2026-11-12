@@ -57,7 +57,11 @@ from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
     parse_metadata_from_safetensors
 from toolkit.train_tools import get_torch_dtype, LearnableSNRGamma, apply_learnable_snr_gos, apply_snr_weight
-from toolkit.timestep_weighing.quantile_weights import sample_timestep_indices
+from toolkit.timestep_weighing.quantile_weights import (
+    FIXED_STEP_TIMESTEP_TYPES,
+    sample_timestep_indices,
+    timestep_weights_supported,
+)
 import gc
 
 from tqdm import tqdm
@@ -190,6 +194,96 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(
                     f"Dataset timestep weights active: dataset={dataset_name}, "
                     f"bins={len(dataset.timestep_weights)}, weights={dataset.timestep_weights}"
+                )
+
+        # Surface config options that would otherwise be silently ignored.
+        fixed_step_types = FIXED_STEP_TIMESTEP_TYPES
+        range_ignoring_types = FIXED_STEP_TIMESTEP_TYPES | {'next_sample'}
+        face_conf = self.get_conf('face_id', None)
+        depth_conf = self.get_conf('depth_consistency', None)
+        any_depth_weight = False
+        if depth_conf is not None:
+            any_depth_weight = float(depth_conf.get('loss_weight', 0.1)) > 0
+        for dataset in self.dataset_configs:
+            if (getattr(dataset, 'depth_loss_weight', None) or 0) > 0:
+                any_depth_weight = True
+
+        aux_range_pairs = [
+            ('depth_loss_weight', 'depth_loss_min_t', 'depth_loss_max_t'),
+            ('identity_loss_weight', 'identity_loss_min_t', 'identity_loss_max_t'),
+            ('body_proportion_loss_weight', 'body_proportion_loss_min_t', 'body_proportion_loss_max_t'),
+            ('body_shape_loss_weight', 'body_shape_loss_min_t', 'body_shape_loss_max_t'),
+            ('normal_loss_weight', 'normal_loss_min_t', 'normal_loss_max_t'),
+            ('vae_anchor_loss_weight', 'vae_anchor_loss_min_t', 'vae_anchor_loss_max_t'),
+            ('latent_perceptual_loss_weight', 'latent_perceptual_loss_min_t', 'latent_perceptual_loss_max_t'),
+        ]
+
+        for dataset in self.dataset_configs:
+            dataset_name = dataset.folder_path or dataset.dataset_path or "unknown"
+            dataset_name = os.path.basename(str(dataset_name).rstrip("/")) or "unknown"
+            effective_type = dataset.timestep_type or self.train_config.timestep_type
+
+            if dataset.timestep_weights and effective_type in fixed_step_types:
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} timestep_weights are ignored "
+                    f"because timestep_type={effective_type} selects fixed steps"
+                )
+            if (
+                (dataset.min_denoising_steps is not None or dataset.max_denoising_steps is not None)
+                and effective_type in range_ignoring_types
+            ):
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} min/max denoising steps are ignored "
+                    f"with timestep_type={effective_type}"
+                )
+            if getattr(dataset, 'diffusion_loss_weight', None) is not None:
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} diffusion_loss_weight is not read by the trainer"
+                )
+
+            if (getattr(dataset, 'depth_loss_weight', None) or 0) > 0 and depth_conf is None:
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} has depth_loss_weight but no global "
+                    "depth_consistency block; the depth loss will be skipped"
+                )
+            face_weight_values = [
+                getattr(dataset, key, None)
+                for key in [
+                    'identity_loss_weight',
+                    'landmark_loss_weight',
+                    'body_proportion_loss_weight',
+                    'body_shape_loss_weight',
+                    'normal_loss_weight',
+                    'vae_anchor_loss_weight',
+                    'face_suppression_weight',
+                ]
+            ]
+            if face_conf is None and any((value or 0) > 0 for value in face_weight_values):
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} has face/body losses enabled but no global "
+                    "face_id block; those losses will be skipped"
+                )
+            if (getattr(dataset, 'latent_perceptual_loss_weight', None) or 0) > 0 and \
+                    self.train_config.latent_perceptual_loss_weight <= 0:
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} has latent_perceptual_loss_weight but "
+                    "train.latent_perceptual_loss_weight is 0; the loss will be skipped"
+                )
+
+            for weight_key, min_key, max_key in aux_range_pairs:
+                weight = getattr(dataset, weight_key, None) or 0
+                if weight <= 0 and (
+                    getattr(dataset, min_key, None) is not None
+                    or getattr(dataset, max_key, None) is not None
+                ):
+                    print_acc(
+                        f"[config] warning: dataset={dataset_name} {min_key}/{max_key} is unused "
+                        f"because {weight_key} is 0"
+                    )
+
+            if dataset.loss_split is not None and not any_depth_weight:
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} loss_split is unused because no depth loss is active"
                 )
 
         self.is_caching_text_embeddings = any(
@@ -1362,16 +1456,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # Per-dataset timestep sampling weights. Unlike the dataset
                 # timestep_type/range overrides above, these are applied per
                 # sample so they also work with pooled/mixed-dataset batches.
-                for item_idx, file_item in enumerate(batch.file_items):
-                    weights = getattr(file_item.dataset_config, "timestep_weights", None)
-                    if weights:
-                        timestep_indices[item_idx] = sample_timestep_indices(
-                            weights,
-                            count=1,
-                            min_index=min_noise_steps,
-                            max_index=max_noise_steps,
-                            device=timestep_indices.device,
-                        )[0]
+                # Fixed-step modes select their own exact indices, so weights
+                # would silently replace that schedule; skip them there.
+                if timestep_weights_supported(effective_timestep_type):
+                    for item_idx, file_item in enumerate(batch.file_items):
+                        weights = getattr(file_item.dataset_config, "timestep_weights", None)
+                        if weights:
+                            timestep_indices[item_idx] = sample_timestep_indices(
+                                weights,
+                                count=1,
+                                min_index=min_noise_steps,
+                                max_index=max_noise_steps,
+                                device=timestep_indices.device,
+                            )[0]
                 timestep_indices = timestep_indices.long()
 
                 if self.train_config.first_timestep_chance > 0.0:
