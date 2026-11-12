@@ -27,6 +27,10 @@ config:
           cache_latents_to_disk: true
           resolution: [512, 768, 1024]
           num_repeats: [16, 4, 1]
+          # Optional: relative timestep sampling weights over equal-count buckets.
+          # Index 0 is the noisiest end of the active range, the last is the cleanest.
+          # This biases how often each region is sampled; it does not scale loss.
+          # timestep_weights: [10, 4, 4, 1, 0]
           is_reg: false
           diffusion_loss_weight: 1.0
           depth_loss_weight: 0.0

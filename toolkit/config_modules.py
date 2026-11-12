@@ -8,6 +8,7 @@ import torchaudio
 
 from toolkit.audio.album_artwork import add_album_artwork
 from toolkit.prompt_utils import PromptEmbeds
+from toolkit.timestep_weighing.quantile_weights import validate_timestep_weights
 from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
 
 ImgExt = Literal['jpg', 'png', 'webp']
@@ -1189,6 +1190,12 @@ class DatasetConfig:
         self.timestep_type = kwargs.get("timestep_type", None)
         self.min_denoising_steps = kwargs.get("min_denoising_steps", None)
         self.max_denoising_steps = kwargs.get("max_denoising_steps", None)
+        # Relative sampling weights across equal-count buckets of the active
+        # timestep range. Index 0 is the noisiest end. Biases which timesteps
+        # the model sees; it does not reweight the loss.
+        self.timestep_weights: Union[List[float], None] = validate_timestep_weights(
+            kwargs.get("timestep_weights", None)
+        )
 
         # ip adapter / reference dataset
         self.clip_image_path: str = kwargs.get('clip_image_path', None)  # depth maps, etc

@@ -342,6 +342,27 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'datasets.timestep_weights': {
+    title: 'Timestep Weights',
+    description: (
+      <>
+        Optional. A comma-separated list of relative values that biases which timesteps this dataset samples during
+        training. For example, <code>{'10, 4, 4, 1, 0'}</code> gives the noisiest fifth of the timestep schedule about
+        53% of the samples and never samples the cleanest fifth.
+        <br />
+        <br />
+        The active timestep range is divided into one bucket per value. Bucket 0 is the noisiest end of that range
+        (t=1000 for flow-matching when the full range is active), and the last bucket is the cleanest end (t=1). Values
+        are relative, not percentages: they are normalized to sum to 1. Use 0 to disable a bucket. Leave this field
+        empty to use the normal sampler.
+        <br />
+        <br />
+        This changes sampling frequency only; it does not multiply the loss. It composes with{' '}
+        <code>min_denoising_steps</code> / <code>max_denoising_steps</code> and applies per dataset, even when a batch
+        mixes samples from multiple datasets.
+      </>
+    ),
+  },
   'train.audio_loss_multiplier': {
     title: 'Audio Loss Multiplier',
     description: (

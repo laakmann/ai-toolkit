@@ -28,6 +28,7 @@ import { openUpsamplePromptsModal, toAspectRatio } from '@/components/UpsamplePr
 import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
+import TimestepWeightsInput from '@/components/TimestepWeightsInput';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
@@ -1344,6 +1345,11 @@ export default function SimpleJob({
                         placeholder={`${jobConfig.config.process[0].train.batch_size}`}
                         min={1}
                         allowEmpty
+                      />
+                      <TimestepWeightsInput
+                        value={dataset.timestep_weights}
+                        className="pt-2"
+                        onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].timestep_weights`)}
                       />
                     </div>
                     <div>

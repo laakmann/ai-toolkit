@@ -57,6 +57,7 @@ from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
     parse_metadata_from_safetensors
 from toolkit.train_tools import get_torch_dtype, LearnableSNRGamma, apply_learnable_snr_gos, apply_snr_weight
+from toolkit.timestep_weighing.quantile_weights import sample_timestep_indices
 import gc
 
 from tqdm import tqdm
@@ -179,7 +180,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.datasets = []
                     self.datasets.append(dataset)
                 self.dataset_configs.append(dataset)
-        
+
+        if self.logging_config.verbose:
+            for dataset in self.dataset_configs:
+                if not dataset.timestep_weights:
+                    continue
+                dataset_name = dataset.folder_path or dataset.dataset_path or "unknown"
+                dataset_name = os.path.basename(str(dataset_name).rstrip("/")) or "unknown"
+                print_acc(
+                    f"Dataset timestep weights active: dataset={dataset_name}, "
+                    f"bins={len(dataset.timestep_weights)}, weights={dataset.timestep_weights}"
+                )
+
         self.is_caching_text_embeddings = any(
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )
@@ -1346,6 +1358,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     timestep_indices = timestep_indices.long()
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
+
+                # Per-dataset timestep sampling weights. Unlike the dataset
+                # timestep_type/range overrides above, these are applied per
+                # sample so they also work with pooled/mixed-dataset batches.
+                for item_idx, file_item in enumerate(batch.file_items):
+                    weights = getattr(file_item.dataset_config, "timestep_weights", None)
+                    if weights:
+                        timestep_indices[item_idx] = sample_timestep_indices(
+                            weights,
+                            count=1,
+                            min_index=min_noise_steps,
+                            max_index=max_noise_steps,
+                            device=timestep_indices.device,
+                        )[0]
+                timestep_indices = timestep_indices.long()
 
                 if self.train_config.first_timestep_chance > 0.0:
                     # index 0 is full noise; per-sample chance to force it
