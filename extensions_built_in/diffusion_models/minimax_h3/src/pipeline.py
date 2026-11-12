@@ -19,6 +19,7 @@ Scheduler (the released math, not diffusers'):
 """
 
 from typing import Optional
+from toolkit.sample_sigmas import sigmas_with_terminal
 
 import numpy as np
 import torch
@@ -71,6 +72,7 @@ class MiniMaxH3Pipeline:
         num_frames: int = 124,
         num_inference_steps: int = 28,
         guidance_scale: float = 1.0,  # ignored
+        sigmas: Optional[list] = None,
         latents: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         ctrl_img: Optional[
@@ -99,7 +101,7 @@ class MiniMaxH3Pipeline:
             t_lat = 1
         h_lat = height // 16
         w_lat = width // 16
-        a_lat = packing.audio_latent_num_frames(num_frames)
+        a_lat = model._num_audio_latents(num_frames)
 
         text_embeds, token_tags = trim_caption_tokens(
             conditional_embeds.text_embeds[0],
@@ -200,14 +202,16 @@ class MiniMaxH3Pipeline:
         audio_rows = pack_audio_latents(audio_noise)  # (1, 2*A, 32)
 
         # --- schedules -----------------------------------------------------
-        sigmas_v = build_sigma_schedule(
-            num_inference_steps,
-            VIDEO_SIGMA_SHIFT,
-            t1000_ladder=getattr(model, "t1000_sample_ladder", False),
-        ).to(device)
+        video_shift = getattr(model, "video_sigma_shift", VIDEO_SIGMA_SHIFT)
+        if sigmas is not None:
+            sigmas_v = torch.tensor(sigmas_with_terminal(sigmas), dtype=torch.float32).to(device)
+        else:
+            sigmas_v = model.build_sample_sigmas(num_inference_steps).to(device)
         # the audio schedule follows the video grid through the closed-form
         # shift remap so both streams sit at the same underlying position
-        sigmas_a = remap_sigma(sigmas_v, VIDEO_SIGMA_SHIFT, AUDIO_SIGMA_SHIFT)
+        sigmas_a = remap_sigma(
+            sigmas_v, video_shift, getattr(model, "audio_sigma_shift", AUDIO_SIGMA_SHIFT)
+        )
 
         position_ids = layout.position_ids[None].to(device)
         tags = layout.token_tags[None].to(device)
@@ -216,6 +220,8 @@ class MiniMaxH3Pipeline:
         text_indices = layout.text_indices.to(device)
 
         # --- denoise loop --------------------------------------------------
+        model._park_vae_for_denoise()
+        model._stage_for_sampling()
         num_steps = sigmas_v.shape[0] - 1
         for i in range(num_steps):
             sv, sv_next = sigmas_v[i], sigmas_v[i + 1]
@@ -244,11 +250,17 @@ class MiniMaxH3Pipeline:
                 text_indices=text_indices,
                 # target-video token grid (patch 1x2x2); consumed only by VSA models
                 vsa_video_grid=(t_lat, h_lat // 2, w_lat // 2),
+                pdd_weights=model._pdd_weights(sv, sv_next),
             )
             v_video = video_pred[:, num_cond:].float()
             v_audio = audio_pred[:, layout.num_condition_audio_rows :].float()
 
             denoised_v = video_rows + sv * v_video
+            # inference engine preview: the video x0 estimate as (1, C, T, H, W);
+            # the audio stream is not previewed
+            emit = getattr(model, "_emit_sample_step", None)
+            if emit is not None and getattr(model, "sample_step_hook", None) is not None:
+                emit(unpatchify_video_tokens(denoised_v, t_lat, h_lat, w_lat), i, num_steps)
             ratio_v = sv_next / sv
             video_rows = ratio_v * video_rows + (1.0 - ratio_v) * denoised_v
 
@@ -258,6 +270,7 @@ class MiniMaxH3Pipeline:
 
         # --- decode --------------------------------------------------------
         video_latents = unpatchify_video_tokens(video_rows, t_lat, h_lat, w_lat)
+        model._stage_for_decode()
         video = model.decode_latents(video_latents)  # (1, 3, T, H, W) in [-1, 1]
         video = ((video.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
         video = video[0].permute(1, 2, 3, 0).cpu()  # (T, H, W, C)

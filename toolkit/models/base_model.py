@@ -26,7 +26,9 @@ from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, conca
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sd_device_states_presets import empty_preset
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
+from toolkit.unloader import FakeTextEncoder
 import torch
+from toolkit.dto import DTO
 from toolkit.pipelines import CustomStableDiffusionXLPipeline
 from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAdapter, DDPMScheduler, \
     LCMScheduler, Transformer2DModel, AutoencoderTiny, ControlNetModel
@@ -101,6 +103,9 @@ class BaseModel:
     # rename LoRA keys transformer. <-> diffusion_model. (the ComfyUI-standard
     # prefix) on save/load
     lora_keys_use_comfy_prefix = False
+    # text-generating models: the trainer runs train_llm_accumulation (model-owned
+    # loss via get_llm_loss) instead of the diffusion step; no vae / text encoder
+    is_llm = False
 
     def __init__(
             self,
@@ -167,6 +172,9 @@ class BaseModel:
         self.invert_assistant_lora = False
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
+        # inference engine: called as hook(step_index, num_steps, latents)
+        # after every scheduler step while generating samples
+        self.sample_step_hook = None
         self.is_transformer = False
 
         self.sample_prompts_cache = None
@@ -251,6 +259,14 @@ class BaseModel:
         return self.arch == 'ssd'
 
     @property
+    def load_rgba(self) -> bool:
+        """Images keep an alpha channel end to end: the dataloader loads them
+        as RGBA (opaque alpha when the source has none), the VAE encodes four
+        channels, and decoded samples keep the alpha. Only models with an RGBA
+        VAE override this."""
+        return False
+
+    @property
     def is_v3(self):
         return self.arch == 'sd3'
 
@@ -277,6 +293,28 @@ class BaseModel:
     @property
     def text_embedding_space_version(self):
         return self.arch
+
+    def get_latent_space_version(self) -> str:
+        """Latent cache key. Override to invalidate caches when model_kwargs change what gets cached."""
+        if self.model_config.latent_space_version is not None:
+            return self.model_config.latent_space_version
+        if self.latent_space_version is not None:
+            return self.latent_space_version
+        if self.is_xl:
+            return 'sdxl'
+        if self.is_v3:
+            return 'sd3'
+        if self.is_auraflow:
+            return 'sdxl'
+        if self.is_flux:
+            return 'flux1'
+        if self.model_config.is_pixart_sigma:
+            return 'sdxl'
+        return self.model_config.arch
+
+    def get_text_embedding_space_version(self) -> str:
+        """Text embedding cache key. Override like get_latent_space_version."""
+        return self.text_embedding_space_version
 
     def get_bucket_divisibility(self):
         if self.vae is None:
@@ -401,6 +439,18 @@ class BaseModel:
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
 
+    def _emit_sample_step(self, latents, step_index=None, num_steps=None):
+        """For holders whose sampling loop bypasses scheduler.step: report one
+        denoised latent to sample_step_hook (no-op when unset)."""
+        from toolkit.sample_step_hook import emit_sample_step
+
+        emit_sample_step(self, latents, step_index, num_steps)
+
+    def _install_sample_step_hooks(self, pipeline):
+        from toolkit.sample_step_hook import install_sample_step_hooks
+
+        return install_sample_step_hooks(self, pipeline)
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -457,6 +507,10 @@ class BaseModel:
             except:
                 pass
 
+        unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
+        from toolkit.sample_sigmas import install_sample_sigma_override
+        unwrap_sigma_override = install_sample_sigma_override(self, pipeline, image_configs)
+
         start_multiplier = 1.0
         if network is not None:
             start_multiplier = network.multiplier
@@ -470,6 +524,7 @@ class BaseModel:
 
                 for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
                     gen_config = image_configs[i]
+                    self.sample_sigmas = gen_config.sigmas
 
                     extra = {}
                     validation_image = None
@@ -517,6 +572,7 @@ class BaseModel:
 
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
+                    self._sample_step_index = 0
                     torch.manual_seed(gen_config.seed)
                     torch.cuda.manual_seed(gen_config.seed)
 
@@ -550,7 +606,11 @@ class BaseModel:
                             quad_count=4
                         )
 
-                    if self.sample_prompts_cache is not None:
+                    if self.is_llm:
+                        # text-generating models take the prompt and media directly
+                        conditional_embeds = None
+                        unconditional_embeds = None
+                    elif self.sample_prompts_cache is not None:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
                     else:
@@ -625,19 +685,21 @@ class BaseModel:
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
                         conditional_embeds = self.encode_prompt(
-                            gen_config.prompt, 
-                            gen_config.prompt_2, 
+                            gen_config.prompt,
+                            gen_config.prompt_2,
                             force_all=True,
-                            control_images=ctrl_img
+                            control_images=ctrl_img,
+                            target_size=(gen_config.width, gen_config.height),
                         )
 
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = True
                         unconditional_embeds = self.encode_prompt(
-                            gen_config.negative_prompt, 
-                            gen_config.negative_prompt_2, 
+                            gen_config.negative_prompt,
+                            gen_config.negative_prompt_2,
                             force_all=True,
-                            control_images=ctrl_img
+                            control_images=ctrl_img,
+                            target_size=(gen_config.width, gen_config.height),
                         )
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
@@ -703,10 +765,12 @@ class BaseModel:
                             raise ValueError(
                                 "Refiner is only supported for XL models")
 
-                    conditional_embeds = conditional_embeds.to(
-                        self.device_torch, dtype=self.unet.dtype)
-                    unconditional_embeds = unconditional_embeds.to(
-                        self.device_torch, dtype=self.unet.dtype)
+                    if conditional_embeds is not None:
+                        conditional_embeds = conditional_embeds.to(
+                            self.device_torch, dtype=self.unet.dtype)
+                    if unconditional_embeds is not None:
+                        unconditional_embeds = unconditional_embeds.to(
+                            self.device_torch, dtype=self.unet.dtype)
 
                     img = self.generate_single_image(
                         pipeline,
@@ -720,11 +784,13 @@ class BaseModel:
                     gen_config.save_image_atomic(img, i)
                     gen_config.log_image(img, i)
                     self._after_sample_image(i, len(image_configs))
-                    flush()
+                    flush(garbage_collect=False)
 
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
 
+        unwrap_step_hooks()
+        unwrap_sigma_override()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         torch.cuda.empty_cache()
@@ -1124,6 +1190,7 @@ class BaseModel:
             max_length=None,
             dropout_prob=0.0,
             control_images=None,
+            target_size=None,
     ) -> PromptEmbeds:
         # sd1.5 embeddings are (bs, 77, 768)
         prompt = prompt
@@ -1135,7 +1202,11 @@ class BaseModel:
             prompt2 = [prompt2]
         # if control_images in the signature, pass it. This keep from breaking plugins
         if self.encode_control_in_text_embeddings:
-            return self.get_prompt_embeds(prompt, control_images=control_images)
+            kwargs = {"control_images": control_images}
+            # target (width, height) only for models that size references against it
+            if target_size is not None and "target_size" in inspect.signature(self.get_prompt_embeds).parameters:
+                kwargs["target_size"] = target_size
+            return self.get_prompt_embeds(prompt, **kwargs)
 
         return self.get_prompt_embeds(prompt)
 
@@ -1187,6 +1258,68 @@ class BaseModel:
     def encode_audio(self, audio_data_list):
         # audio_date_list is a list of {"waveform": waveform[C, L], "sample_rate": int(sample_rate)}
         raise NotImplementedError("Audio encoding not implemented for this model.")
+
+    # ------------------------------------------------------------------
+    # Joint audio stream contract. A model with an audio stream resolves its
+    # audio input through audio_stream_input and returns through
+    # audio_stream_output, so every trainer sees one shape:
+    #   input : a latent DTO carrying `audio` marks a stream-aware caller (an
+    #           on-policy distiller). Its rows, already noised at the audio
+    #           sigma, replace the dataset soundtrack; `audio=None` asks for a
+    #           fresh noised start. Plain tensors keep the dataset path.
+    #   output: DTO(video_pred, audio=pred, audio_target=noise - clean | None,
+    #           audio_noisy=the rows the model saw, audio_sigma=sigma_a)
+    #           whenever a target exists or the caller streams; else the tensor.
+    # ------------------------------------------------------------------
+    def audio_sigma(self, sigma_v: torch.Tensor) -> torch.Tensor:
+        """Audio-stream sigma coupled to a video sigma (0..1). Default: shared."""
+        return sigma_v
+
+    def audio_stream_input(self, latent_model_input, batch, raw_audio, sigma_a, silence_rows):
+        """Returns (audio_rows, audio_target, audio_noisy, stream). raw_audio is the
+        clean dataset audio in the model's row layout or None; silence_rows is the
+        model's no-soundtrack input (shape/dtype/device reference)."""
+        stream = isinstance(latent_model_input, DTO) and "audio" in latent_model_input.extras
+        override = latent_model_input.get("audio") if stream else None
+        sa = sigma_a.to(silence_rows.device, silence_rows.dtype).view(
+            (-1,) + (1,) * (silence_rows.dim() - 1)
+        )
+        if override is not None:
+            rows = override.to(silence_rows.device, silence_rows.dtype)
+            return rows, None, rows, True
+        if raw_audio is not None:
+            raw_audio = raw_audio.to(silence_rows.device, silence_rows.dtype)
+            # the audio noise is drawn once per step and shared by every pass
+            # (prior, primary, cfg/guidance, preservation) so they all see the
+            # same soundtrack; it rides on the latents DTO with the clean audio
+            # so on-the-fly encodes are not repeated per pass
+            noise = batch.latents.get("audio_noise") if isinstance(batch.latents, DTO) else None
+            if noise is not None and noise.shape == raw_audio.shape:
+                noise = noise.to(raw_audio.device, raw_audio.dtype)
+            else:
+                noise = torch.randn_like(raw_audio)
+                if batch.latents is not None:
+                    batch.latents = DTO(batch.latents, audio=raw_audio, audio_noise=noise)
+            # mixed in fp32 so bf16 rows match the scheduler's add_noise numerics
+            rows = ((1.0 - sa.float()) * raw_audio.float() + sa.float() * noise.float()).to(raw_audio.dtype)
+            return rows, (noise - raw_audio).detach(), rows, stream
+        if stream:
+            # no soundtrack: silence noised at the audio sigma (pure noise at 1.0)
+            rows = sa * torch.randn_like(silence_rows)
+            return rows, None, rows, True
+        return silence_rows, None, None, False
+
+    def audio_stream_output(self, video_pred, audio_pred, audio_target, audio_noisy, sigma_a, stream):
+        """audio_pred in ai-toolkit's noise - clean convention."""
+        if audio_target is None and not stream:
+            return video_pred
+        return DTO(
+            video_pred,
+            audio=audio_pred,
+            audio_target=audio_target,
+            audio_noisy=audio_noisy,
+            audio_sigma=sigma_a,
+        )
 
     def decode_latents(
             self,
@@ -1432,7 +1565,7 @@ class BaseModel:
             'vae': {
                 'training': self.vae.training,
                 'device': self.vae.device,
-            },
+            } if self.vae is not None else None,
             'unet': {
                 'training': self.unet.training,
                 'device': self.unet.device,
@@ -1441,16 +1574,21 @@ class BaseModel:
         }
         if isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
+            # unloaded TEs are FakeTextEncoder stubs; arch probes into TE internals would raise
+            any_fake = any(isinstance(e, FakeTextEncoder) for e in self.text_encoder)
             for encoder in self.text_encoder:
-                te_has_grad = self.get_te_has_grad()
+                te_has_grad = False if any_fake else self.get_te_has_grad()
                 self.device_state['text_encoder'].append({
                     'training': encoder.training,
                     'device': encoder.device,
                     # todo there has to be a better way to do this
                     'requires_grad': te_has_grad
                 })
-        else:
-            te_has_grad = self.get_te_has_grad()
+        elif self.text_encoder is not None:
+            if isinstance(self.text_encoder, FakeTextEncoder):
+                te_has_grad = False
+            else:
+                te_has_grad = self.get_te_has_grad()
 
             self.device_state['text_encoder'] = {
                 'training': self.text_encoder.training,
@@ -1501,11 +1639,12 @@ class BaseModel:
         self.device_state = None
 
     def set_device_state(self, state):
-        if state['vae']['training']:
-            self.vae.train()
-        else:
-            self.vae.eval()
-        self.vae.to(state['vae']['device'])
+        if self.vae is not None and state.get('vae') is not None:
+            if state['vae']['training']:
+                self.vae.train()
+            else:
+                self.vae.eval()
+            self.vae.to(state['vae']['device'])
         if state['unet']['training']:
             self.unet.train()
         else:
@@ -1533,7 +1672,7 @@ class BaseModel:
                     encoder.to(state['text_encoder']['device'])
                     encoder.requires_grad_(
                         state['text_encoder']['requires_grad'])
-        else:
+        elif self.text_encoder is not None:
             if state['text_encoder']['training']:
                 self.text_encoder.train()
             else:
@@ -1572,6 +1711,8 @@ class BaseModel:
             active_modules = ['vae']
         if device_state_preset in ['cache_clip']:
             active_modules = ['clip']
+        if device_state_preset in ['cache_text_encoder']:
+            active_modules = ['text_encoder']
         if device_state_preset in ['generate']:
             active_modules = ['vae', 'unet',
                               'text_encoder', 'adapter', 'refiner_unet']
@@ -1627,7 +1768,7 @@ class BaseModel:
         if isinstance(self.text_encoder, list):
             for encoder in self.text_encoder:
                 encoder.to(*args, **kwargs)
-        else:
+        elif self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
 
     def component_load_kwargs(self, role: str = "transformer", dtype=None):
@@ -1709,3 +1850,11 @@ class BaseModel:
     def scale_loss(self, loss):
         # called to get the loss scaler for the model. Can be overridden in child classes
         return loss
+    
+    def get_x0_prediction(self, model_output: torch.Tensor, model_input: torch.Tensor, sigma: torch.Tensor):
+        # can be overridden in child classes to get the x0 prediction from model output
+        # step latent, use here or with do_fft_loss
+        if self.x0_pred:
+            return model_output
+        else:
+            return model_input - sigma * model_output

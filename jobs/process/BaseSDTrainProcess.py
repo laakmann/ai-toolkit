@@ -345,6 +345,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 guidance_scale=sample_item.guidance_scale,
                 guidance_rescale=sample_config.guidance_rescale,
                 num_inference_steps=sample_item.sample_steps,
+                sigmas=sample_item.sigmas,
                 network_multiplier=sample_item.network_multiplier,
                 output_path=output_path,
                 output_ext=sample_config.ext,
@@ -354,6 +355,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 logger=self.logger,
                 num_frames=sample_item.num_frames,
                 fps=sample_item.fps,
+                duration=sample_item.duration,
                 ctrl_img=sample_item.ctrl_img,
                 ctrl_idx=sample_item.ctrl_idx,
                 ctrl_img_1=sample_item.ctrl_img_1,
@@ -746,7 +748,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.accelerator.even_batches=False
         
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
-        self.sd.vae = self.accelerator.prepare(self.sd.vae)
+        if self.sd.vae is not None:
+            self.sd.vae = self.accelerator.prepare(self.sd.vae)
         if self.sd.unet is not None:
             self.sd.unet = self.accelerator.prepare(self.sd.unet)
             # todo always tdo it?
@@ -1098,7 +1101,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 is_reg = any(batch.get_is_reg_list())
                 if batch.tensor is not None:
                     imgs = batch.tensor
-                    imgs = imgs.to(self.device_torch, dtype=dtype)
+                    # waveforms stay fp32 into the audio encoder
+                    imgs = imgs.to(self.device_torch, dtype=torch.float32 if getattr(self.sd, 'is_audio_model', False) else dtype)
                     # dont adjust for regs.
                     if self.train_config.img_multiplier is not None and not is_reg:
                         # do it ad contrast
@@ -1266,7 +1270,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
-                if effective_timestep_type in ['two_step', 'four_step', 'eight_step']:
+                if getattr(self.sd.noise_scheduler, 'fixed_train_sigmas', None) is not None:
+                    # the scheduler's timesteps are the model's own sampling schedule
+                    timestep_indices = torch.randint(
+                        0,
+                        len(self.sd.noise_scheduler.timesteps),
+                        (batch_size,),
+                        device=self.device_torch
+                    )
+                    timestep_indices = timestep_indices.long()
+                elif effective_timestep_type in ['two_step', 'four_step', 'eight_step']:
                     if effective_timestep_type == 'two_step':
                         indice_choices = [0, 499]
                     elif effective_timestep_type == 'four_step':
@@ -1828,7 +1841,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         noise_scheduler = self.sd.noise_scheduler
 
         if self.train_config.xformers:
-            vae.enable_xformers_memory_efficient_attention()
+            if vae is not None:
+                vae.enable_xformers_memory_efficient_attention()
             unet.enable_xformers_memory_efficient_attention()
             if isinstance(text_encoder, list):
                 for te in text_encoder:
@@ -1904,15 +1918,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for te in text_encoder:
                 te.requires_grad_(False)
                 te.eval()
-        else:
+        elif text_encoder is not None:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
-        vae = vae.to(torch.device('cpu'), dtype=dtype)
-        vae.requires_grad_(False)
-        vae.eval()
+        if vae is not None:
+            vae = vae.to(torch.device('cpu'), dtype=dtype)
+            vae.requires_grad_(False)
+            vae.eval()
         if self.train_config.learnable_snr_gos:
             self.snr_gos = LearnableSNRGamma(
                 self.sd.noise_scheduler, device=self.device_torch
@@ -2276,10 +2291,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         ds.cache_tensors_to_disk = True
         # load datasets if passed in the root process
         if self.datasets is not None:
-            self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+            self.data_loader = get_dataloader_from_datasets(
+                self.datasets, self.train_config.batch_size, self.sd,
+                pool_datasets=self.train_config.pool_datasets,
+            )
         if self.datasets_reg is not None:
-            self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
-                                                                self.sd)
+            self.data_loader_reg = get_dataloader_from_datasets(
+                self.datasets_reg, self.train_config.batch_size, self.sd,
+                pool_datasets=self.train_config.pool_datasets,
+            )
+
+        # a fresh text-embedding cache leaves the text encoder on the gpu (the
+        # datasets don't restore placement: that would bounce it per dataset).
+        # Park it once here, before accelerator.prepare brings the unet up.
+        if (
+            self.is_caching_text_embeddings
+            and self.model_config.low_vram
+            and self.sd.text_encoder is not None
+        ):
+            self.sd.text_encoder_to('cpu')
 
         flush()
         self.last_save_step = self.step_num

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from typing import List, Optional
+from toolkit.sample_sigmas import sigmas_with_terminal
 
 import torch
 from einops import rearrange, repeat
@@ -298,6 +299,7 @@ class Krea2Pipeline:
         width: int = 1024,
         num_inference_steps: int = 28,
         guidance_scale: float = 4.5,
+        sigmas: Optional[List[float]] = None,
         latents: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         ref_latents: Optional[List[List[torch.Tensor]]] = None,
@@ -344,7 +346,10 @@ class Krea2Pipeline:
         align = ae_scale * patch
         x1 = (minres // align) ** 2
         x2 = (maxres // align) ** 2
-        ts = timesteps(gh * gw, num_inference_steps, x1, x2, y1=y1, y2=y2, mu=mu)
+        if sigmas is not None:
+            ts = sigmas_with_terminal(sigmas)
+        else:
+            ts = timesteps(gh * gw, num_inference_steps, x1, x2, y1=y1, y2=y2, mu=mu)
 
         # With the kv_cache model kwarg (isolated ref attention) the ref K/V
         # are step-invariant, so the very first model call doubles as the
@@ -357,7 +362,8 @@ class Krea2Pipeline:
             ref_cache = {"kv": None, "mask": None}
 
         # Euler integration of the flow ODE (with optional CFG).
-        for tcurr, tprev in zip(ts[:-1], ts[1:]):
+        num_steps = len(ts) - 1
+        for i, (tcurr, tprev) in enumerate(zip(ts[:-1], ts[1:])):
             t = torch.full((latents.shape[0],), tcurr, dtype=dtype, device=device)
             v_cond = predict_velocity(
                 transformer,
@@ -383,7 +389,12 @@ class Krea2Pipeline:
                 v = v_cond + guidance_scale * (v_cond - v_uncond)
             else:
                 v = v_cond
-            latents = latents + (tprev - tcurr) * v.to(torch.float32)
+            v = v.to(torch.float32)
+            # inference engine preview: x0 estimate for this step
+            emit = getattr(model, "_emit_sample_step", None)
+            if emit is not None and getattr(model, "sample_step_hook", None) is not None:
+                emit(latents - float(tcurr) * v, i, num_steps)
+            latents = latents + (tprev - tcurr) * v
 
         images = model.decode_latents(latents, device=device, dtype=dtype)
         images = images.float().clamp(-1.0, 1.0)

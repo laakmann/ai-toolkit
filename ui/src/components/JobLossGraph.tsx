@@ -1,7 +1,7 @@
 'use client';
 
 import { Job } from '@prisma/client';
-import useJobLossLog, { LossPoint } from '@/hooks/useJobLossLog';
+import useJobLossLog, { LossSeries } from '@/hooks/useJobLossLog';
 import { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
@@ -172,10 +172,10 @@ function dulledColor(rgba: string): string {
   return `rgba(${r},${g},${b},1)`;
 }
 
-function hasFinitePoints(points: LossPoint[] | undefined): boolean {
-  if (!points || points.length === 0) return false;
-  for (const p of points) {
-    if (p.value !== null && Number.isFinite(p.value as number)) return true;
+function hasFinitePoints(s: LossSeries | undefined): boolean {
+  if (!s || s.values.length === 0) return false;
+  for (const v of s.values) {
+    if (Number.isFinite(v)) return true;
   }
   return false;
 }
@@ -393,7 +393,16 @@ export default function JobLossGraph({ job }: Props) {
     });
   }, [lossKeys]);
 
-  const activeKeys = useMemo(() => visibleLossKeys.filter(k => enabled[k] !== false), [visibleLossKeys, enabled]);
+  // Keys not yet in `enabled` (data and keys now arrive in the same render,
+  // before the sync effect above has run) take their default here rather than
+  // rendering as enabled and getting pruned a frame later.
+  const activeKeys = useMemo(
+    () =>
+      visibleLossKeys.filter(
+        k => enabled[k] ?? persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss'),
+      ),
+    [visibleLossKeys, enabled],
+  );
 
   // Assign palette slots by position in the (sorted) lossKeys list rather than
   // by hashing the key name — hashing let different keys collide onto the same
@@ -417,10 +426,12 @@ export default function JobLossGraph({ job }: Props) {
     // Union of all steps across active series.
     const stepSet = new Set<number>();
     for (const key of activeKeys) {
-      const pts: LossPoint[] = series[key] ?? [];
-      for (const p of pts) {
-        if (p.value === null || !Number.isFinite(p.value as number)) continue;
-        stepSet.add(p.step);
+      const s: LossSeries | undefined = series[key];
+      if (!s) continue;
+      for (let i = 0; i < s.steps.length; i++) {
+        const v = s.values[i];
+        if (!Number.isFinite(v)) continue;
+        stepSet.add(s.steps[i]);
       }
     }
     let xs = Array.from(stepSet).sort((a, b) => a - b);
@@ -450,17 +461,17 @@ export default function JobLossGraph({ job }: Props) {
       const key = activeKeys[ki];
       const keyLabel = keyLabelByKey[key] ?? key;
       const scaleKey = `y::${key}`;
-      const pts: LossPoint[] = series[key] ?? [];
+      const s: LossSeries = series[key] ?? { steps: [], values: [] };
       const mapAll = new Map<number, number>();
       const mapLog = new Map<number, number>();
       let positiveCount = 0;
-      for (const p of pts) {
-        if (p.value === null || !Number.isFinite(p.value as number)) continue;
-        if (!xsSet.has(p.step)) continue;
-        const value = p.value as number;
-        mapAll.set(p.step, value);
+      for (let i = 0; i < s.steps.length; i++) {
+        const value = s.values[i];
+        if (!Number.isFinite(value)) continue;
+        if (!xsSet.has(s.steps[i])) continue;
+        mapAll.set(s.steps[i], value);
         if (value > 0) {
-          mapLog.set(p.step, value);
+          mapLog.set(s.steps[i], value);
           positiveCount += 1;
         }
       }
