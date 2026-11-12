@@ -15,7 +15,15 @@ from .ernie_image import ErnieImageModel
 from .nucleus_image import NucleusImageModel
 from .hidream.hidream_o1_model import HidreamO1Model
 from .z_image.z_image_l2p_model import ZImageL2PModel
-from .anima import AnimaModel
+
+try:
+    from .anima import AnimaModel
+except ImportError as e:
+    # Anima needs a newer diffusers than some existing installs. Don't let one
+    # optional model make every training job fail to import.
+    AnimaModel = None
+    print(f"Warning: Anima model disabled: {e}")
+    print("         Update diffusers from requirements.txt to enable Anima.")
 from .ideogram4 import Ideogram4Model
 from .prx_pixel_t2i import PRXPixelT2IModel
 from .krea2 import Krea2Model
@@ -63,7 +71,6 @@ AI_TOOLKIT_MODELS = [
     NucleusImageModel,
     HidreamO1Model,
     ZImageL2PModel,
-    AnimaModel,
     Ideogram4Model,
     PRXPixelT2IModel,
     Krea2Model,
@@ -82,3 +89,6 @@ AI_TOOLKIT_MODELS = [
     MossImageModel,
     Fibo2Model,
 ]
+
+if AnimaModel is not None:
+    AI_TOOLKIT_MODELS.append(AnimaModel)
