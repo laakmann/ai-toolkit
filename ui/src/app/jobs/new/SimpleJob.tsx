@@ -32,6 +32,7 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import type { DatasetStats } from '@/hooks/useDatasetStats';
 
 type Props = {
   jobConfig: JobConfig;
@@ -43,6 +44,7 @@ type Props = {
   setGpuIDs: (value: string | null) => void;
   gpuList: any;
   datasetOptions: any;
+  datasetStatsByPath?: Record<string, DatasetStats>;
   isLoading?: boolean;
 };
 
@@ -58,6 +60,7 @@ export default function SimpleJob({
   setGpuIDs,
   gpuList,
   datasetOptions,
+  datasetStatsByPath,
   isLoading,
 }: Props) {
   const { archs: modelArchs, groupedModelOptions } = useModelArchs();
@@ -84,6 +87,13 @@ export default function SimpleJob({
   const isAudioModel = !!(modelArch?.group === 'audio');
   // text-generating models: samples are media in, text out (no size)
   const isLlmModel = !!(modelArch?.group === 'llm');
+
+  const formatInt = (value: number) => value.toLocaleString();
+
+  const getRepeatFactor = (value: unknown) => {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+    return null;
+  };
 
   const taggedSampleArr: Record<string, any>[] | null = useMemo(() => {
     if (!modelArch) return null;
@@ -1215,6 +1225,45 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
                         options={datasetOptions}
                       />
+                      {dataset.folder_path && datasetStatsByPath?.[dataset.folder_path] && (() => {
+                        const stats = datasetStatsByPath[dataset.folder_path];
+                        const captionExt = (dataset.caption_ext || 'txt').toLowerCase();
+                        const captionCount =
+                          stats.caption_counts[captionExt as keyof DatasetStats['caption_counts']] ?? 0;
+                        const coverage =
+                          stats.image_count > 0 ? `${((captionCount / stats.image_count) * 100).toFixed(1)}%` : '0.0%';
+                        const repeatFactor = getRepeatFactor(dataset.num_repeats);
+                        const effectiveImageCount =
+                          repeatFactor !== null ? Math.round(stats.image_count * repeatFactor) : null;
+                        return (
+                          <div className="mt-2 text-xs text-gray-400 leading-relaxed">
+                            <div>
+                              Images: <span className="text-gray-200">{formatInt(stats.image_count)}</span>
+                              {stats.video_count > 0 && (
+                                <>
+                                  {' '}
+                                  | Videos: <span className="text-gray-200">{formatInt(stats.video_count)}</span>
+                                </>
+                              )}
+                              {stats.audio_count > 0 && (
+                                <>
+                                  {' '}
+                                  | Audio: <span className="text-gray-200">{formatInt(stats.audio_count)}</span>
+                                </>
+                              )}
+                            </div>
+                            <div>
+                              Caption ext {dataset.caption_ext || 'txt'}: <span className="text-gray-200">{formatInt(captionCount)}</span>{' '}
+                              ({coverage} coverage)
+                            </div>
+                            {effectiveImageCount !== null && (
+                              <div>
+                                Effective images at repeats x{repeatFactor}: <span className="text-gray-200">{formatInt(effectiveImageCount)}</span>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
                       {modelArch?.additionalSections?.includes('datasets.control_path') && (
                         <SelectInput
                           label="Control Dataset"

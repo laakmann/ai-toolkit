@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
 import { jobTypeOptions } from './options';
@@ -11,6 +11,7 @@ import { SelectInput } from '@/components/formInputs';
 import useSettings from '@/hooks/useSettings';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import useDatasetList from '@/hooks/useDatasetList';
+import useDatasetStats, { type DatasetStats } from '@/hooks/useDatasetStats';
 import YAML from 'yaml';
 import path from 'path';
 import { TopBar, MainContent } from '@/components/layout';
@@ -32,6 +33,7 @@ export default function TrainingForm() {
   const { settings, isSettingsLoaded } = useSettings();
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
   const { datasets, status: datasetFetchStatus } = useDatasetList();
+  const { datasetStats, status: datasetStatsStatus } = useDatasetStats();
   const [datasetOptions, setDatasetOptions] = useState<{ value: string; label: string }[]>([]);
   const [showAdvancedView, setShowAdvancedView] = useState(false);
 
@@ -102,6 +104,16 @@ export default function TrainingForm() {
       });
     }
   }, [datasets, settings, isSettingsLoaded, datasetFetchStatus]);
+
+  const datasetStatsByPath = useMemo(() => {
+    if (!isSettingsLoaded) return {};
+    const out: Record<string, DatasetStats> = {};
+    for (const datasetStat of datasetStats) {
+      const datasetPath = path.join(settings.DATASETS_FOLDER, datasetStat.name);
+      out[datasetPath] = datasetStat;
+    }
+    return out;
+  }, [datasetStats, settings, isSettingsLoaded]);
 
   // clone existing job
   useEffect(() => {
@@ -324,7 +336,13 @@ export default function TrainingForm() {
               setGpuIDs={setGpuIDs}
               gpuList={gpuList}
               datasetOptions={datasetOptions}
-              isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}
+              datasetStatsByPath={datasetStatsByPath}
+              isLoading={
+                !isSettingsLoaded ||
+                !isGPUInfoLoaded ||
+                datasetFetchStatus !== 'success' ||
+                datasetStatsStatus === 'loading'
+              }
             />
           </ErrorBoundary>
 

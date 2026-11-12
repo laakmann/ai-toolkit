@@ -1,0 +1,132 @@
+job: extension
+config:
+  name: "id4_mixed_normal_perceptual"
+  process:
+    - type: "sd_trainer"
+      training_folder: "output"
+      device: cuda:0
+
+      network:
+        type: "lokr"
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+
+      save:
+        dtype: bf16
+        save_every: 250
+        max_step_saves_to_keep: 8
+        save_format: diffusers
+
+      datasets:
+        - folder_path: datasets/normal_set_a
+          caption_ext: txt
+          cache_latents_to_disk: true
+          resolution: [512, 768, 1024]
+          num_repeats: [16, 4, 1]
+          is_reg: false
+          diffusion_loss_weight: 1.0
+          depth_loss_weight: 0.0
+          identity_loss_weight: 0.0
+          landmark_loss_weight: 0.0
+          body_proportion_loss_weight: 0.0
+          body_shape_loss_weight: 0.0
+          normal_loss_weight: 0.0
+          vae_anchor_loss_weight: 0.0
+          latent_perceptual_loss_weight: 0.0
+
+        - folder_path: datasets/perceptual_set_b
+          caption_ext: txt
+          cache_latents_to_disk: true
+          resolution: [512, 768, 1024]
+          num_repeats: [16, 4, 1]
+          is_reg: false
+          diffusion_loss_weight: 1.0
+          depth_loss_weight: 0.05
+          depth_loss_min_t: 0.2
+          depth_loss_max_t: 0.9
+          identity_loss_weight: 0.05
+          identity_loss_min_t: 0.2
+          identity_loss_max_t: 0.8
+          identity_loss_min_cos: 0.2
+          landmark_loss_weight: 0.02
+          body_proportion_loss_weight: 0.02
+          body_proportion_loss_min_t: 0.2
+          body_proportion_loss_max_t: 0.8
+          body_shape_loss_weight: 0.01
+          body_shape_loss_min_t: 0.4
+          body_shape_loss_max_t: 0.8
+          normal_loss_weight: 0.01
+          normal_loss_min_t: 0.4
+          normal_loss_max_t: 0.8
+          vae_anchor_loss_weight: 0.01
+          vae_anchor_loss_min_t: 0.0
+          vae_anchor_loss_max_t: 0.5
+          face_suppression_weight: 0.5
+          face_suppression_expand: 2.0
+          face_suppression_soft: true
+          latent_perceptual_loss_weight: 0.0
+
+      train:
+        batch_size: 1
+        gradient_accumulation: 4
+        steps: 1200
+        gradient_checkpointing: true
+        train_unet: true
+        train_text_encoder: false
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        lr: 5e-5
+        dtype: bf16
+        loss_type: mse
+        timestep_type: linear
+
+        weight_noise:
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          log_every: 10
+          bound_norm: true
+
+        latent_perceptual_loss_weight: 0.0
+
+      model:
+        name_or_path: "ideogram-ai/ideogram-4-fp8"
+        arch: ideogram4
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        low_vram: false
+        model_kwargs:
+          max_text_length: 3072
+
+      face_id:
+        enabled: false
+        face_model: buffalo_l
+        identity_loss_weight: 0.0
+        landmark_loss_weight: 0.0
+        body_proportion_loss_weight: 0.0
+        body_shape_loss_weight: 0.0
+        normal_loss_weight: 0.0
+        vae_anchor_loss_weight: 0.0
+
+      depth_consistency:
+        loss_weight: 0.0
+        loss_min_t: 0.0
+        loss_max_t: 1.0
+        model_id: depth-anything/Depth-Anything-V2-Small-hf
+        input_size: 518
+        ssi_weight: 1.0
+        grad_weight: 0.5
+        grad_scales: 4
+        mask_source: subject
+        grad_checkpoint: true
+
+      subject_mask:
+        enabled: true
+        yolo_conf: 0.25
+        primary_only: true
