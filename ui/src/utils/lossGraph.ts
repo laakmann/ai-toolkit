@@ -165,12 +165,26 @@ export interface MovingStats {
 }
 
 /**
+ * Window actually used for a series. A window wider than the run shrinks to
+ * half the available observations (minimum 2) so the line still has a
+ * meaningful stretch to draw after warmup, instead of falling back to a noisy
+ * expanding mean or drawing nothing at all.
+ */
+export function effectiveMaWindow(requested: number, validCount: number): number {
+  const w = clampMaWindow(requested);
+  if (validCount >= w) return w;
+  return Math.max(MA_WINDOW_MIN, Math.floor(validCount / 2));
+}
+
+/**
  * Trailing mean and approximate 95% confidence interval for that mean.
  *
- * The window expands while fewer than `window` valid points exist, so the line
- * remains visible when the selected window is wider than the current run.
- * Invalid/gap points remain null and do not consume window capacity. The
- * interval is mean +/- z * sampleStdDev / sqrt(n); it is not a prediction band.
+ * Strict warmup: nothing is emitted until `window` valid points have been
+ * seen, so the volatile start of a run cannot leak into the line. When the run
+ * is shorter than the selected window, `effectiveMaWindow` shrinks the window
+ * instead. Invalid/gap points remain null and do not consume window capacity.
+ * The interval is mean +/- z * sampleStdDev / sqrt(n); it is not a prediction
+ * band.
  */
 export function trailingMovingStatsWithNulls(
   ys: (number | null)[],
@@ -181,7 +195,13 @@ export function trailingMovingStatsWithNulls(
   const lower: (number | null)[] = new Array(ys.length).fill(null);
   const upper: (number | null)[] = new Array(ys.length).fill(null);
 
-  const w = clampMaWindow(window);
+  let validCount = 0;
+  for (let i = 0; i < ys.length; i++) {
+    const v = ys[i];
+    if (v !== null && Number.isFinite(v)) validCount += 1;
+  }
+
+  const w = effectiveMaWindow(window, validCount);
   const ring = new Float64Array(w);
   let count = 0;
   let index = 0;
@@ -205,19 +225,54 @@ export function trailingMovingStatsWithNulls(
     sumSq += v * v;
     index = (index + 1) % w;
 
+    if (count < w) continue;
+
     const avg = sum / count;
     mean[i] = avg;
 
-    if (count >= 2) {
-      // Clamp tiny negative values caused by floating-point cancellation.
-      const variance = Math.max(0, (sumSq - count * avg * avg) / (count - 1));
-      const margin = z * Math.sqrt(variance / count);
-      lower[i] = avg - margin;
-      upper[i] = avg + margin;
-    }
+    // Clamp tiny negative values caused by floating-point cancellation.
+    const variance = Math.max(0, (sumSq - count * avg * avg) / (count - 1));
+    const margin = z * Math.sqrt(variance / count);
+    lower[i] = avg - margin;
+    upper[i] = avg + margin;
   }
 
   return { mean, lower, upper };
+}
+
+/**
+ * Values for the observation-knot series: the MA value at the exact steps that
+ * have a real logged observation. Drawing these as points makes it obvious
+ * where (and how sparsely) a series was actually sampled without relying on the
+ * raw-points layer.
+ */
+export function observationKnots(
+  mean: (number | null)[],
+  raw: (number | null)[],
+): (number | null)[] {
+  const out: (number | null)[] = new Array(mean.length).fill(null);
+  for (let i = 0; i < mean.length; i++) {
+    const r = raw[i];
+    if (r === null || !Number.isFinite(r)) continue;
+    const m = mean[i];
+    out[i] = m === undefined ? null : m;
+  }
+  return out;
+}
+
+/**
+ * Dots are redundant on a dense series while its raw points are already drawn,
+ * but they are the whole point on sparse series (and when raw points are
+ * hidden).
+ */
+export function shouldShowObservationKnots(
+  observedCount: number,
+  plottedCount: number,
+  rawPointsVisible: boolean,
+): boolean {
+  if (observedCount <= 0 || plottedCount <= 0) return false;
+  if (!rawPointsVisible) return true;
+  return observedCount < plottedCount * 0.9;
 }
 
 // Tableau-style categorical palette, ordered so the first few series are

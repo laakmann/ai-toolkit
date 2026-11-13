@@ -5,12 +5,15 @@ import {
   MA_WINDOW_MAX,
   MA_WINDOW_MIN,
   clampMaWindow,
+  effectiveMaWindow,
   formatLossKeyLabel,
   formatLossSeriesLabel,
   maWindowToSlider,
+  observationKnots,
   parseLossKey,
   seriesColor,
   seriesIdentityKey,
+  shouldShowObservationKnots,
   sliderToMaWindow,
   trailingMovingStatsWithNulls,
   trendDash,
@@ -71,27 +74,31 @@ test('ma window clamping and slider mapping', () => {
   }
 });
 
-test('moving average uses an expanding warmup and keeps a band', () => {
+test('moving average waits for a full window before plotting', () => {
   const stats = trailingMovingStatsWithNulls([1, 2, 3, 4, 5], 3);
-  assert.deepEqual(stats.mean, [1, 1.5, 2, 3, 4]);
+  assert.deepEqual(stats.mean, [null, null, 2, 3, 4]);
   assert.equal(stats.lower[0], null);
-  assert.equal(stats.upper[0], null);
-  for (let i = 1; i < stats.mean.length; i++) {
+  assert.equal(stats.lower[1], null);
+  for (let i = 2; i < stats.mean.length; i++) {
     assert.ok((stats.lower[i] as number) <= (stats.mean[i] as number));
     assert.ok((stats.upper[i] as number) >= (stats.mean[i] as number));
   }
 });
 
-test('a window wider than the run does not produce an empty line', () => {
+test('a window wider than the run shrinks to half the run', () => {
+  assert.equal(effectiveMaWindow(2000, 3), 2);
+  assert.equal(effectiveMaWindow(2000, 10), 5);
+  assert.equal(effectiveMaWindow(25, 100), 25);
+
   const stats = trailingMovingStatsWithNulls([2, 4, 6], 2000);
-  assert.deepEqual(stats.mean, [2, 3, 4]);
+  assert.deepEqual(stats.mean, [null, 3, 5]);
   assert.ok(stats.lower[2] !== null);
   assert.ok(stats.upper[2] !== null);
 });
 
 test('gaps stay gaps and do not consume window capacity', () => {
   const stats = trailingMovingStatsWithNulls([1, null, 3], 2);
-  assert.deepEqual(stats.mean, [1, null, 2]);
+  assert.deepEqual(stats.mean, [null, null, 2]);
   assert.equal(stats.lower[1], null);
   assert.ok(Math.abs((stats.lower[2] as number) - 0.04) < 1e-9);
   assert.ok(Math.abs((stats.upper[2] as number) - 3.96) < 1e-9);
@@ -99,9 +106,24 @@ test('gaps stay gaps and do not consume window capacity', () => {
 
 test('constant series has a zero-width confidence interval', () => {
   const stats = trailingMovingStatsWithNulls([5, 5, 5], 3);
-  assert.deepEqual(stats.mean, [5, 5, 5]);
-  assert.deepEqual(stats.lower.slice(1), [5, 5]);
-  assert.deepEqual(stats.upper.slice(1), [5, 5]);
+  assert.deepEqual(stats.mean, [null, null, 5]);
+  assert.equal(stats.lower[1], null);
+  assert.deepEqual(stats.lower.slice(2), [5]);
+  assert.deepEqual(stats.upper.slice(2), [5]);
+});
+
+test('observation knots sit on the MA value and skip unlogged steps', () => {
+  const mean = [null, 1.5, 2, 3, 3.5] as (number | null)[];
+  const raw = [1, 2, null, null, 5] as (number | null)[];
+  assert.deepEqual(observationKnots(mean, raw), [null, 1.5, null, null, 3.5]);
+});
+
+test('observation dots are limited to sparse series while raw points are visible', () => {
+  assert.equal(shouldShowObservationKnots(10, 10, true), false);
+  assert.equal(shouldShowObservationKnots(5, 10, true), true);
+  assert.equal(shouldShowObservationKnots(10, 10, false), true);
+  assert.equal(shouldShowObservationKnots(0, 10, false), false);
+  assert.equal(shouldShowObservationKnots(3, 0, false), false);
 });
 
 test('palette colours and trend patterns stay distinct', () => {

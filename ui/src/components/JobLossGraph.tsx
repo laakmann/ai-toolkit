@@ -17,8 +17,10 @@ import {
   formatLossSeriesLabel,
   maWindowToSlider,
   metricDash,
+  observationKnots,
   parseLossKey,
   seriesColor,
+  shouldShowObservationKnots,
   sliderToMaWindow,
   trailingMovingStatsWithNulls,
   trendDash,
@@ -114,12 +116,14 @@ function emaWithNulls(ys: (number | null)[], alpha: number): (number | null)[] {
 interface PersistedSettings {
   smoothingMode: 'ema' | 'ma';
   useLogScale: boolean;
+  sharedAxis: boolean;
   showRawSeries: boolean;
   showAuxSeries: boolean;
   showTrend: boolean;
   emaSmoothing: number;
   showMovingAverage: boolean;
   showRawPoints: boolean;
+  showObservationDots: boolean;
   showConfidenceBand: boolean;
   maWindow: number;
   plotStride: number;
@@ -154,12 +158,14 @@ export default function JobLossGraph({ job }: Props) {
   // Controls
   const [smoothingMode, setSmoothingMode] = useState<'ema' | 'ma'>('ema');
   const [useLogScale, setUseLogScale] = useState(false);
+  const [sharedAxis, setSharedAxis] = useState(true);
   const [showRawSeries, setShowRawSeries] = useState(false);
   const [showAuxSeries, setShowAuxSeries] = useState(false);
   const [showTrend, setShowTrend] = useState(true);
   const [emaSmoothing, setEmaSmoothing] = useState(80);
   const [showMovingAverage, setShowMovingAverage] = useState(true);
   const [showRawPoints, setShowRawPoints] = useState(true);
+  const [showObservationDots, setShowObservationDots] = useState(true);
   const [showConfidenceBand, setShowConfidenceBand] = useState(false);
 
   // Number of recent valid samples used per series for central tendency.
@@ -228,6 +234,7 @@ export default function JobLossGraph({ job }: Props) {
           setSmoothingMode('ma');
         }
         if (typeof s.useLogScale === 'boolean') setUseLogScale(s.useLogScale);
+        if (typeof s.sharedAxis === 'boolean') setSharedAxis(s.sharedAxis);
         if (typeof s.showRawSeries === 'boolean') setShowRawSeries(s.showRawSeries);
         if (typeof s.showAuxSeries === 'boolean') setShowAuxSeries(s.showAuxSeries);
         if (typeof s.showTrend === 'boolean') setShowTrend(s.showTrend);
@@ -235,6 +242,7 @@ export default function JobLossGraph({ job }: Props) {
         else if (typeof s.smoothing === 'number') setEmaSmoothing(s.smoothing);
         if (typeof s.showMovingAverage === 'boolean') setShowMovingAverage(s.showMovingAverage);
         if (typeof s.showRawPoints === 'boolean') setShowRawPoints(s.showRawPoints);
+        if (typeof s.showObservationDots === 'boolean') setShowObservationDots(s.showObservationDots);
         if (typeof s.showConfidenceBand === 'boolean') setShowConfidenceBand(s.showConfidenceBand);
         if (typeof s.maWindow === 'number') setMaWindow(clampMaWindow(s.maWindow));
         else if (typeof s.smoothing === 'number') {
@@ -263,12 +271,14 @@ export default function JobLossGraph({ job }: Props) {
       const payload: PersistedSettings = {
         smoothingMode,
         useLogScale,
+        sharedAxis,
         showRawSeries,
         showAuxSeries,
         showTrend,
         emaSmoothing,
         showMovingAverage,
         showRawPoints,
+        showObservationDots,
         showConfidenceBand,
         maWindow,
         plotStride,
@@ -283,12 +293,14 @@ export default function JobLossGraph({ job }: Props) {
     hydrated,
     smoothingMode,
     useLogScale,
+    sharedAxis,
     showRawSeries,
     showAuxSeries,
     showTrend,
     emaSmoothing,
     showMovingAverage,
     showRawPoints,
+    showObservationDots,
     showConfidenceBand,
     maWindow,
     plotStride,
@@ -404,28 +416,10 @@ export default function JobLossGraph({ job }: Props) {
 
     const xsSet = new Set(xs);
 
-    const data: (number[] | (number | null)[])[] = [xs];
-    const seriesConfigs: uPlot.Series[] = [{}]; // x
-    const bands: uPlot.Band[] = [];
-
-    // Each metric gets its own y-scale (so unrelated magnitudes auto-range
-    // independently) plus a matching colored axis.
-    const scales: uPlot.Scales = { x: { time: false } };
-    const axes: uPlot.Axis[] = [
-      {
-        stroke: 'rgba(255,255,255,0.55)',
-        grid: { stroke: 'rgba(255,255,255,0.06)' },
-        ticks: { stroke: 'rgba(255,255,255,0.15)' },
-      },
-    ];
-
-    // Data columns belonging to each scale, for per-scale clip percentiles.
-    const scaleArrays: Record<string, (number | null)[][]> = {};
-
-    for (let ki = 0; ki < activeKeys.length; ki++) {
-      const key = activeKeys[ki];
-      const keyLabel = keyLabelByKey[key] ?? key;
-      const scaleKey = `y::${key}`;
+    // Pass 1: align every active series to the shared x grid, keeping both the
+    // full and positive-only maps so a shared axis can pick its distribution
+    // once for all series.
+    const prepared = activeKeys.map(key => {
       const s: LossSeries = series[key] ?? { steps: [], values: [] };
       const mapAll = new Map<number, number>();
       const mapLog = new Map<number, number>();
@@ -440,7 +434,56 @@ export default function JobLossGraph({ job }: Props) {
           positiveCount += 1;
         }
       }
-      const useSeriesLogScale = useLogScale && positiveCount >= 2;
+      return { key, keyLabel: keyLabelByKey[key] ?? key, mapAll, mapLog, positiveCount };
+    });
+
+    // A shared log axis needs at least one series with positive samples.
+    // Non-positive points are dropped in log mode, exactly as they are on a
+    // per-series log axis today.
+    const sharedLogActive = sharedAxis && useLogScale && prepared.some(p => p.positiveCount >= 2);
+
+    const makeScale = (scaleKey: string, logScale: boolean): uPlot.Scale => ({
+      distr: logScale ? 3 : 1,
+      range: (_u, dataMin, dataMax) => {
+        const c = yClipRef.current?.[scaleKey];
+        if (c) return [c.min, c.max];
+        if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) return [0, 1];
+        if (dataMin === dataMax) {
+          if (logScale) {
+            const v = dataMin > 0 ? dataMin : 1e-6;
+            return [Math.max(v * 0.9, 1e-6), Math.max(v * 1.1, 1e-5)];
+          }
+          return [dataMin - 0.5, dataMax + 0.5];
+        }
+        return [dataMin, dataMax];
+      },
+    });
+
+    const data: (number[] | (number | null)[])[] = [xs];
+    const seriesConfigs: uPlot.Series[] = [{}]; // x
+    const bands: uPlot.Band[] = [];
+
+    // Each metric gets its own y-scale (so unrelated magnitudes auto-range
+    // independently) plus a matching colored axis. With `sharedAxis` every
+    // series uses a single neutral `y` scale instead.
+    const scales: uPlot.Scales = { x: { time: false } };
+    const axes: uPlot.Axis[] = [
+      {
+        stroke: 'rgba(255,255,255,0.55)',
+        grid: { stroke: 'rgba(255,255,255,0.06)' },
+        ticks: { stroke: 'rgba(255,255,255,0.15)' },
+      },
+    ];
+
+    if (sharedAxis) scales.y = makeScale('y', sharedLogActive);
+
+    // Data columns belonging to each scale, for per-scale clip percentiles.
+    const scaleArrays: Record<string, (number | null)[][]> = {};
+
+    for (let ki = 0; ki < prepared.length; ki++) {
+      const { key, keyLabel, mapAll, mapLog, positiveCount } = prepared[ki];
+      const scaleKey = sharedAxis ? 'y' : `y::${key}`;
+      const useSeriesLogScale = sharedAxis ? sharedLogActive : useLogScale && positiveCount >= 2;
       const map = useSeriesLogScale ? mapLog : mapAll;
       const raw: (number | null)[] = xs.map(s => (map.has(s) ? (map.get(s) as number) : null));
       const movingStats = trailingMovingStatsWithNulls(raw, maWindow);
@@ -515,7 +558,10 @@ export default function JobLossGraph({ job }: Props) {
             stroke: 'transparent',
             width: 0,
             fill: 'transparent',
-            spanGaps: false,
+            // Span gaps so a sparse series (e.g. a per-dataset metric) still
+            // produces one continuous shaded region between its observations
+            // instead of isolated vertical ticks.
+            spanGaps: true,
             points: { show: false },
             value: () => '',
           });
@@ -530,7 +576,7 @@ export default function JobLossGraph({ job }: Props) {
             stroke: 'transparent',
             width: 0,
             fill: 'transparent',
-            spanGaps: false,
+            spanGaps: true,
             points: { show: false },
             value: () => '',
           });
@@ -570,37 +616,64 @@ export default function JobLossGraph({ job }: Props) {
             value: (_u, value) => formatNum(value),
           });
           colArrays.push(movingStats.mean);
+
+          // Knots mark where the series was actually logged. They are redundant
+          // on dense series while raw points are visible, so the helper limits
+          // them to series with real gaps (or whenever raw points are hidden).
+          if (
+            showObservationDots &&
+            shouldShowObservationKnots(visiblePointCount, raw.length, showRawPoints)
+          ) {
+            const knots = observationKnots(movingStats.mean, raw);
+            data.push(knots);
+            seriesConfigs.push({
+              label: `${keyLabel} observations`,
+              class: 'u-obs-dots',
+              scale: scaleKey,
+              stroke: color,
+              width: 0,
+              paths: () => null,
+              spanGaps: false,
+              points: { show: true, size: 3, width: 0 },
+              value: () => '',
+            });
+            colArrays.push(knots);
+          }
         }
       }
 
-      scaleArrays[scaleKey] = colArrays;
+      const bucket = scaleArrays[scaleKey] ?? (scaleArrays[scaleKey] = []);
+      bucket.push(...colArrays);
 
-      scales[scaleKey] = {
-        distr: useSeriesLogScale ? 3 : 1,
-        range: (_u, dataMin, dataMax) => {
-          const c = yClipRef.current?.[scaleKey];
-          if (c) return [c.min, c.max];
-          if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) return [0, 1];
-          if (dataMin === dataMax) {
-            if (useSeriesLogScale) {
-              const v = dataMin > 0 ? dataMin : 1e-6;
-              return [Math.max(v * 0.9, 1e-6), Math.max(v * 1.1, 1e-5)];
-            }
-            return [dataMin - 0.5, dataMax + 0.5];
-          }
-          return [dataMin, dataMax];
-        },
-      };
+      if (!sharedAxis) {
+        scales[scaleKey] = makeScale(scaleKey, useSeriesLogScale);
 
+        axes.push({
+          scale: scaleKey,
+          side: ki % 2 === 0 ? 3 : 1, // alternate left / right
+          stroke: color,
+          label: useLogScale && !useSeriesLogScale ? `${keyLabel} (lin)` : keyLabel,
+          labelSize: 14,
+          // Only the first scale draws gridlines; overlaying grids from multiple
+          // independent scales would be unreadable.
+          grid: { show: ki === 0, stroke: 'rgba(255,255,255,0.06)' },
+          ticks: { stroke: 'rgba(255,255,255,0.15)' },
+          size: 60,
+          values: (_u, ticks) => ticks.map(tk => formatNum(tk)),
+        });
+      }
+    }
+
+    // One neutral axis for every series; the legend and series chips carry the
+    // per-series identity instead of the axis colours.
+    if (sharedAxis) {
       axes.push({
-        scale: scaleKey,
-        side: ki % 2 === 0 ? 3 : 1, // alternate left / right
-        stroke: color,
-        label: useLogScale && !useSeriesLogScale ? `${keyLabel} (lin)` : keyLabel,
+        scale: 'y',
+        side: 3,
+        stroke: 'rgba(255,255,255,0.55)',
+        label: sharedLogActive ? 'shared loss (log)' : useLogScale ? 'shared loss (linear)' : 'shared loss',
         labelSize: 14,
-        // Only the first scale draws gridlines; overlaying grids from multiple
-        // independent scales would be unreadable.
-        grid: { show: ki === 0, stroke: 'rgba(255,255,255,0.06)' },
+        grid: { show: true, stroke: 'rgba(255,255,255,0.06)' },
         ticks: { stroke: 'rgba(255,255,255,0.15)' },
         size: 60,
         values: (_u, ticks) => ticks.map(tk => formatNum(tk)),
@@ -640,8 +713,10 @@ export default function JobLossGraph({ job }: Props) {
     plotStride,
     windowSize,
     useLogScale,
+    sharedAxis,
     showMovingAverage,
     showRawPoints,
+    showObservationDots,
     showConfidenceBand,
     clipOutliers,
     keyLabelByKey,
@@ -671,15 +746,17 @@ export default function JobLossGraph({ job }: Props) {
   // axis distribution changes. Data updates go through setData.
   const hasData = (built.data[0]?.length ?? 0) > 1;
   const structuralKey = useMemo(
-    () => `${activeKeys.join('|')}|mode=${smoothingMode}|trend=${showTrend}|ma=${showMovingAverage}|pts=${showRawPoints}|ci=${showConfidenceBand && smoothingMode === 'ma' && showMovingAverage}|log=${useLogScale}|has=${hasData}`,
+    () => `${activeKeys.join('|')}|mode=${smoothingMode}|trend=${showTrend}|ma=${showMovingAverage}|pts=${showRawPoints}|dots=${showObservationDots}|ci=${showConfidenceBand && smoothingMode === 'ma' && showMovingAverage}|log=${useLogScale}|shared=${sharedAxis}|has=${hasData}`,
     [
       activeKeys,
       smoothingMode,
       showTrend,
       showMovingAverage,
       showRawPoints,
+      showObservationDots,
       showConfidenceBand,
       useLogScale,
+      sharedAxis,
       hasData,
     ],
   );
@@ -1031,11 +1108,18 @@ export default function JobLossGraph({ job }: Props) {
                     label="95% CI"
                     disabled={!showMovingAverage}
                   />
+                  <ToggleButton
+                    checked={showObservationDots && showMovingAverage}
+                    onClick={() => setShowObservationDots(v => !v)}
+                    label="Observation dots"
+                    disabled={!showMovingAverage}
+                  />
                 </>
               )}
               <ToggleButton checked={showRawSeries} onClick={() => setShowRawSeries(v => !v)} label="Show raw series" />
               <ToggleButton checked={showAuxSeries} onClick={() => setShowAuxSeries(v => !v)} label="Show aux series" />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
+              <ToggleButton checked={sharedAxis} onClick={() => setSharedAxis(v => !v)} label="Shared Y axis" />
               <ToggleButton checked={clipOutliers} onClick={() => setClipOutliers(v => !v)} label="Clip outliers" />
             </div>
           </div>
@@ -1097,8 +1181,10 @@ export default function JobLossGraph({ job }: Props) {
                   <span>{MA_WINDOW_MAX.toLocaleString()} pts</span>
                 </div>
                 <div className="mt-1 text-[11px] text-gray-500">
-                  Trailing MA over recent points. It uses an expanding mean until the window fills, so a window wider
-                  than the run stays visible. 95% CI is the standard error of the windowed mean.
+                  Trailing MA over recent points. The line starts only once the window is full, so volatile early
+                  steps no longer leak into it; a window wider than the run shrinks to half the run. 95% CI is the
+                  standard error of the windowed mean, and observation dots mark where the series was actually
+                  logged.
                 </div>
               </>
             )}
@@ -1139,7 +1225,8 @@ export default function JobLossGraph({ job }: Props) {
         .uplot .u-legend .u-marker {
           border-radius: 2px;
         }
-        .uplot .u-legend tr.u-ci-band {
+        .uplot .u-legend tr.u-ci-band,
+        .uplot .u-legend tr.u-obs-dots {
           display: none;
         }
         .uplot .u-select {
