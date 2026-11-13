@@ -67,4 +67,12 @@ echo "Pod Started"
 setup_ssh
 export_env_vars
 echo "Starting AI Toolkit UI..."
-cd /app/ai-toolkit/ui && npm run start 
+cd /app/ai-toolkit/ui
+# Migrate the mounted database to the schema this image was built with. The
+# image build runs `update_db` too, but at runtime aitk_db.db is usually a
+# bind-mounted volume from an older install, so it needs the same migration.
+if ! npm run update_db; then
+    echo "WARNING: database migration failed; the UI and jobs may see a stale schema."
+    echo "         Check that /app/ai-toolkit/aitk_db.db is writable."
+fi
+npm run start

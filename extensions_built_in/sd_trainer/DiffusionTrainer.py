@@ -29,6 +29,10 @@ class DiffusionTrainer(SDTrainer):
             self.is_ui_trainer = False
         else:
             print(f"Job ID: \"{self.job_id}\"")
+        # Optional Job columns we already found missing in the database. A
+        # database created by an older version won't have newer columns until
+        # `npm run update_db` migrates it; that must not abort a long run.
+        self._missing_db_columns = set()
         
         if self.is_ui_trainer:
             self.is_stopping = False
@@ -134,31 +138,47 @@ class DiffusionTrainer(SDTrainer):
                     raise
         raise last_error
 
-    def should_stop(self):
-        if not self.is_ui_trainer:
+    def _read_job_flag(self, column: str) -> bool:
+        """Read a boolean flag from the Job row for this job.
+
+        Flags are looked up by column name from our own code, never user input.
+        If the database predates a column (for example, a DB created before
+        `sample_now` was added), the flag is treated as unset and the run keeps
+        going instead of dying. ``npm run update_db`` in ``ui/`` adds the
+        missing columns.
+        """
+        if not self.is_ui_trainer or column in self._missing_db_columns:
             return False
-        def _check_stop():
+
+        def _check_flag():
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT stop FROM Job WHERE id = ?", (self.job_id,))
-                stop = cursor.fetchone()
-                return False if stop is None else stop[0] == 1
+                    f"SELECT {column} FROM Job WHERE id = ?", (self.job_id,))
+                row = cursor.fetchone()
+                return False if row is None else row[0] == 1
 
-        return self._retry_db_operation(_check_stop)
+        try:
+            return self._retry_db_operation(_check_flag)
+        except sqlite3.OperationalError as e:
+            if "no such column" not in str(e):
+                raise
+            self._missing_db_columns.add(column)
+            print(
+                f"[AITK] Warning: Job.{column} is missing from "
+                f"{self.sqlite_db_path}; ignoring it for this run."
+            )
+            print(
+                "[AITK]          Run `npm run update_db` in ui/ "
+                "(or restart with ./run_linux.sh) to migrate the database."
+            )
+            return False
+
+    def should_stop(self):
+        return self._read_job_flag("stop")
 
     def should_return_to_queue(self):
-        if not self.is_ui_trainer:
-            return False
-        def _check_return_to_queue():
-            with self._db_connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT return_to_queue FROM Job WHERE id = ?", (self.job_id,))
-                return_to_queue = cursor.fetchone()
-                return False if return_to_queue is None else return_to_queue[0] == 1
-
-        return self._retry_db_operation(_check_return_to_queue)
+        return self._read_job_flag("return_to_queue")
 
     def maybe_stop(self):
         if not self.is_ui_trainer:
@@ -175,17 +195,7 @@ class DiffusionTrainer(SDTrainer):
             raise Exception("Job returning to queue")
 
     def should_save(self):
-        if not self.is_ui_trainer:
-            return False
-        def _check_save():
-            with self._db_connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT save_now FROM Job WHERE id = ?", (self.job_id,))
-                save_now = cursor.fetchone()
-                return False if save_now is None else save_now[0] == 1
-
-        return self._retry_db_operation(_check_save)
+        return self._read_job_flag("save_now")
 
     def maybe_save(self):
         if not self.is_ui_trainer:
@@ -204,17 +214,7 @@ class DiffusionTrainer(SDTrainer):
                 self.progress_bar.unpause()
 
     def should_sample(self):
-        if not self.is_ui_trainer:
-            return False
-        def _check_sample():
-            with self._db_connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT sample_now FROM Job WHERE id = ?", (self.job_id,))
-                sample_now = cursor.fetchone()
-                return False if sample_now is None else sample_now[0] == 1
-
-        return self._retry_db_operation(_check_sample)
+        return self._read_job_flag("sample_now")
 
     def maybe_sample(self):
         if not self.is_ui_trainer:
