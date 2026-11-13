@@ -6,6 +6,24 @@ import { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import { openConfirm } from '@/components/ConfirmModal';
+import { Check, ChevronDown } from 'lucide-react';
+import classNames from 'classnames';
+import {
+  DEFAULT_MA_WINDOW,
+  MA_WINDOW_MAX,
+  MA_WINDOW_MIN,
+  clampMaWindow,
+  formatLossKeyLabel,
+  formatLossSeriesLabel,
+  maWindowToSlider,
+  metricDash,
+  parseLossKey,
+  seriesColor,
+  sliderToMaWindow,
+  trailingMovingStatsWithNulls,
+  trendDash,
+  withAlpha,
+} from '@/utils/lossGraph';
 
 interface Props {
   job: Job;
@@ -85,60 +103,11 @@ function emaWithNulls(ys: (number | null)[], alpha: number): (number | null)[] {
   return out;
 }
 
-// Trailing moving average over the last N valid samples in the series.
-// Nulls remain null (gaps) and do not consume window capacity.
-// Strict warmup: emit null until N valid samples have been seen.
-function trailingMovingAverageWithNulls(ys: (number | null)[], window: number): (number | null)[] {
-  const out: (number | null)[] = new Array(ys.length).fill(null);
-  const w = Math.max(1, window | 0);
-  const queue: number[] = [];
-  let sum = 0;
+// Trailing moving average / confidence stats live in utils/lossGraph.ts.
 
-  for (let i = 0; i < ys.length; i++) {
-    const v = ys[i];
-    if (v === null || !Number.isFinite(v)) {
-      out[i] = null;
-      continue;
-    }
-
-    const value = v as number;
-    queue.push(value);
-    sum += value;
-    if (queue.length > w) {
-      sum -= queue.shift() as number;
-    }
-
-    if (queue.length < w) {
-      out[i] = null;
-      continue;
-    }
-
-    out[i] = sum / w;
-  }
-
-  return out;
-}
-
-function hashToIndex(str: string, mod: number) {
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return Math.abs(h) % mod;
-}
 // Hue order is deliberate: adjacent slots are maximally separated for
 // colorblind viewers, validated against the gray-950 chart surface.
-const PALETTE = [
-  'rgba(57,135,229,1)', // blue
-  'rgba(0,131,0,1)', // green
-  'rgba(213,81,129,1)', // magenta
-  'rgba(201,133,0,1)', // yellow
-  'rgba(25,158,112,1)', // aqua
-  'rgba(217,89,38,1)', // orange
-  'rgba(144,133,233,1)', // violet
-  'rgba(230,103,103,1)', // red
-];
+// (Palette lives in utils/lossGraph.ts.)
 
 // Persisted, per-URL graph settings. Sliders + display toggles + which loss
 // series are visible. Zoom / highlighted window is intentionally NOT persisted.
@@ -151,6 +120,7 @@ interface PersistedSettings {
   emaSmoothing: number;
   showMovingAverage: boolean;
   showRawPoints: boolean;
+  showConfidenceBand: boolean;
   maWindow: number;
   plotStride: number;
   clipOutliers: boolean;
@@ -161,15 +131,6 @@ interface PersistedSettings {
 function settingsStorageKey(): string | null {
   if (typeof window === 'undefined') return null;
   return `jobLossGraph:${window.location.pathname}${window.location.search}`;
-}
-
-function dulledColor(rgba: string): string {
-  const m = rgba.match(/rgba?\((\d+),(\d+),(\d+)/);
-  if (!m) return 'rgba(120,120,120,1)';
-  const r = Math.round(Number(m[1]) * 0.55);
-  const g = Math.round(Number(m[2]) * 0.55);
-  const b = Math.round(Number(m[3]) * 0.55);
-  return `rgba(${r},${g},${b},1)`;
 }
 
 function hasFinitePoints(s: LossSeries | undefined): boolean {
@@ -187,48 +148,6 @@ function isAuxiliarySeriesKey(key: string): boolean {
     || key.startsWith('loss/bad_state_guard/');
 }
 
-function formatLossKeyLabel(key: string): string {
-  if (key === 'loss/loss') return 'loss';
-
-  if (key.startsWith('loss_by_dataset/')) {
-    const rest = key.slice('loss_by_dataset/'.length);
-    const parts = rest.split('/').filter(Boolean);
-    if (parts.length < 2) return rest;
-
-    const datasetSeq = parts[0];
-    const metric = parts[parts.length - 1];
-    const pathParts = parts.slice(1, -1);
-    // Keys are shaped like: dN/datasetLabel[/subdir]/metric.
-    // We intentionally show only the final subdirectory token in labels.
-    const rawSubdir = pathParts.length > 1 ? pathParts.slice(1).join('/') : null;
-    const subdir = rawSubdir
-      ? rawSubdir
-        .split('/')
-        .filter(Boolean)
-        .pop() ?? null
-      : null;
-
-    let suffix = metric;
-    if (metric === 'effective') suffix = 'loss';
-    else if (metric === 'raw') suffix = 'loss_raw';
-    else if (metric === 'reg_consistency_effective') suffix = 'reg_consistency_loss';
-
-    if (subdir && subdir !== 'root') return `${datasetSeq}/${subdir}/${suffix}`;
-    if (subdir === 'root') return `${datasetSeq}/root/${suffix}`;
-    if (suffix === 'reg_consistency_loss') return `${datasetSeq}/${suffix}`;
-    return `${datasetSeq}/root/${suffix}`;
-  }
-
-  if (key.startsWith('loss/')) {
-    const rest = key.slice('loss/'.length);
-    if (rest.endsWith('/effective')) return `${rest.slice(0, -'/effective'.length)}/loss`;
-    if (rest.endsWith('/raw')) return `${rest.slice(0, -'/raw'.length)}/loss_raw`;
-    return rest;
-  }
-
-  return key;
-}
-
 export default function JobLossGraph({ job }: Props) {
   const { series, lossKeys, status, refreshLoss, deleteRange } = useJobLossLog(job.id, 2000);
 
@@ -241,9 +160,27 @@ export default function JobLossGraph({ job }: Props) {
   const [emaSmoothing, setEmaSmoothing] = useState(80);
   const [showMovingAverage, setShowMovingAverage] = useState(true);
   const [showRawPoints, setShowRawPoints] = useState(true);
+  const [showConfidenceBand, setShowConfidenceBand] = useState(false);
 
   // Number of recent valid samples used per series for central tendency.
-  const [maWindow, setMaWindow] = useState(25);
+  const [maWindow, setMaWindow] = useState(DEFAULT_MA_WINDOW);
+  const [maInput, setMaInput] = useState(String(DEFAULT_MA_WINDOW));
+  useEffect(() => {
+    setMaInput(String(maWindow));
+  }, [maWindow]);
+
+  const commitMaInput = () => {
+    const next = clampMaWindow(Number(maInput));
+    setMaWindow(next);
+    setMaInput(String(next));
+  };
+
+  // Series selector collapses on mobile so many datasets stay manageable.
+  // Defaults to expanded on desktop after mount.
+  const [seriesPanelOpen, setSeriesPanelOpen] = useState(false);
+  useEffect(() => {
+    setSeriesPanelOpen(window.matchMedia('(min-width: 768px)').matches);
+  }, []);
 
   // UI-only downsample for rendering speed
   const [plotStride, setPlotStride] = useState(1);
@@ -298,10 +235,11 @@ export default function JobLossGraph({ job }: Props) {
         else if (typeof s.smoothing === 'number') setEmaSmoothing(s.smoothing);
         if (typeof s.showMovingAverage === 'boolean') setShowMovingAverage(s.showMovingAverage);
         if (typeof s.showRawPoints === 'boolean') setShowRawPoints(s.showRawPoints);
-        if (typeof s.maWindow === 'number') setMaWindow(s.maWindow);
+        if (typeof s.showConfidenceBand === 'boolean') setShowConfidenceBand(s.showConfidenceBand);
+        if (typeof s.maWindow === 'number') setMaWindow(clampMaWindow(s.maWindow));
         else if (typeof s.smoothing === 'number') {
           const mappedWindow = Math.round(2 + clamp01(s.smoothing / 100) * 198);
-          setMaWindow(mappedWindow);
+          setMaWindow(clampMaWindow(mappedWindow));
         }
         if (typeof s.plotStride === 'number') setPlotStride(s.plotStride);
         if (typeof s.clipOutliers === 'boolean') setClipOutliers(s.clipOutliers);
@@ -331,6 +269,7 @@ export default function JobLossGraph({ job }: Props) {
         emaSmoothing,
         showMovingAverage,
         showRawPoints,
+        showConfidenceBand,
         maWindow,
         plotStride,
         clipOutliers,
@@ -350,6 +289,7 @@ export default function JobLossGraph({ job }: Props) {
     emaSmoothing,
     showMovingAverage,
     showRawPoints,
+    showConfidenceBand,
     maWindow,
     plotStride,
     clipOutliers,
@@ -396,24 +336,48 @@ export default function JobLossGraph({ job }: Props) {
   // Keys not yet in `enabled` (data and keys now arrive in the same render,
   // before the sync effect above has run) take their default here rather than
   // rendering as enabled and getting pruned a frame later.
-  const activeKeys = useMemo(
-    () =>
-      visibleLossKeys.filter(
-        k => enabled[k] ?? persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss'),
-      ),
-    [visibleLossKeys, enabled],
+  const isSeriesSelected = useCallback(
+    (key: string) =>
+      enabled[key] ?? persistedEnabledRef.current?.[key] ?? (key === 'loss/loss' || key === 'val/loss'),
+    [enabled],
   );
 
-  // Assign palette slots by position in the (sorted) lossKeys list rather than
-  // by hashing the key name — hashing let different keys collide onto the same
-  // color. Keyed off lossKeys (not activeKeys) so toggling a series off never
-  // repaints the others.
-  const colorByKey = useMemo(() => {
-    const m: Record<string, string> = {};
-    lossKeys.forEach((k, i) => {
-      m[k] = PALETTE[i % PALETTE.length];
-    });
-    return m;
+  const activeKeys = useMemo(
+    () => visibleLossKeys.filter(isSeriesSelected),
+    [visibleLossKeys, isSeriesSelected],
+  );
+
+  // Assign colours by dataset sequence so d1/d2/... always use the first
+  // palette slots. Hidden/aux global keys therefore never consume a dataset
+  // colour. Keyed off lossKeys so toggling never repaints.
+  const { colorByKey, trendDashByKey } = useMemo(() => {
+    const colors: Record<string, string> = {};
+    const dashes: Record<string, number[]> = {};
+    let extra = 0;
+
+    for (const key of lossKeys) {
+      const info = parseLossKey(key);
+      if (info.kind === 'dataset' && info.datasetSeq !== null) {
+        const slot = Math.max(0, info.datasetSeq - 1);
+        colors[key] = seriesColor(slot);
+        dashes[key] = trendDash(slot);
+        continue;
+      }
+
+      if (key === 'loss/loss') {
+        colors[key] = '#E5E7EB';
+        dashes[key] = trendDash(extra);
+      } else if (key === 'val/loss') {
+        colors[key] = '#94A3B8';
+        dashes[key] = trendDash(extra);
+      } else {
+        colors[key] = seriesColor(24 + extra);
+        dashes[key] = trendDash(extra + 8);
+      }
+      extra += 1;
+    }
+
+    return { colorByKey: colors, trendDashByKey: dashes };
   }, [lossKeys]);
 
   // Build uPlot-aligned data + series configs.
@@ -442,6 +406,7 @@ export default function JobLossGraph({ job }: Props) {
 
     const data: (number[] | (number | null)[])[] = [xs];
     const seriesConfigs: uPlot.Series[] = [{}]; // x
+    const bands: uPlot.Band[] = [];
 
     // Each metric gets its own y-scale (so unrelated magnitudes auto-range
     // independently) plus a matching colored axis.
@@ -478,12 +443,15 @@ export default function JobLossGraph({ job }: Props) {
       const useSeriesLogScale = useLogScale && positiveCount >= 2;
       const map = useSeriesLogScale ? mapLog : mapAll;
       const raw: (number | null)[] = xs.map(s => (map.has(s) ? (map.get(s) as number) : null));
-      const movingAverage = trailingMovingAverageWithNulls(raw, maWindow);
+      const movingStats = trailingMovingStatsWithNulls(raw, maWindow);
       const smooth = emaWithNulls(raw, emaAlpha);
       const trend = emaWithNulls(raw, trendAlpha);
 
-      const color = colorByKey[key] ?? PALETTE[0];
-      const colorDull = dulledColor(color);
+      const color = colorByKey[key] ?? seriesColor(0);
+      const trendColor = withAlpha(color, 0.72);
+      const keyInfo = parseLossKey(key);
+      const variantDash = metricDash(keyInfo.metric);
+      const trendLineDash = trendDashByKey[key] ?? trendDash(0);
 
       const visiblePointCount = raw.reduce<number>((n, v) => (v === null || !Number.isFinite(v) ? n : n + 1), 0);
       let contiguousSegmentCount = 0;
@@ -491,7 +459,6 @@ export default function JobLossGraph({ job }: Props) {
         if (raw[i] !== null && raw[i - 1] !== null) contiguousSegmentCount += 1;
       }
       const isolatedPointsOnly = visiblePointCount > 0 && contiguousSegmentCount === 0;
-      const spanGaps = isolatedPointsOnly;
       const showSparsePoints = visiblePointCount > 0 && (visiblePointCount <= 2 || isolatedPointsOnly);
 
       const colArrays: (number | null)[][] = [];
@@ -499,10 +466,11 @@ export default function JobLossGraph({ job }: Props) {
       if (smoothingMode === 'ema') {
         data.push(smooth);
         seriesConfigs.push({
-          label: keyLabel,
+          label: formatLossSeriesLabel(key, 'ema'),
           scale: scaleKey,
           stroke: color,
           width: 2,
+          dash: variantDash,
           spanGaps: true,
           points: showSparsePoints ? { show: true, size: 6 } : { show: false },
           value: (_u, value) => formatNum(value),
@@ -512,10 +480,11 @@ export default function JobLossGraph({ job }: Props) {
         if (showTrend && visiblePointCount >= 3) {
           data.push(trend);
           seriesConfigs.push({
-            label: `${keyLabel} (trend)`,
+            label: formatLossSeriesLabel(key, 'trend'),
             scale: scaleKey,
-            stroke: colorDull,
-            width: 2.5,
+            stroke: trendColor,
+            width: 2,
+            dash: trendLineDash,
             spanGaps: true,
             points: { show: false },
             value: (_u, value) => formatNum(value),
@@ -523,9 +492,59 @@ export default function JobLossGraph({ job }: Props) {
           colArrays.push(trend);
         }
       } else {
+        const showMa = showMovingAverage && visiblePointCount >= 2;
+
+        // Draw the confidence band first so its translucent fill sits behind
+        // the raw points and the mean line. Bound columns exist whenever CI is
+        // enabled (even while all bounds are null) so the series shape stays
+        // stable as points arrive.
+        if (showConfidenceBand && showMovingAverage) {
+          // Confidence bands are meaningless on a log axis when the lower
+          // bound is at or below zero; drop those edge points instead.
+          const guard = (v: number | null) =>
+            useSeriesLogScale && v !== null && v <= 0 ? null : v;
+          const lower = movingStats.lower.map(guard);
+          const upper = movingStats.upper.map(guard);
+
+          const lowerIndex = data.length;
+          data.push(lower);
+          seriesConfigs.push({
+            label: `${keyLabel} CI low`,
+            class: 'u-ci-band',
+            scale: scaleKey,
+            stroke: 'transparent',
+            width: 0,
+            fill: 'transparent',
+            spanGaps: false,
+            points: { show: false },
+            value: () => '',
+          });
+          colArrays.push(lower);
+
+          const upperIndex = data.length;
+          data.push(upper);
+          seriesConfigs.push({
+            label: `${keyLabel} CI high`,
+            class: 'u-ci-band',
+            scale: scaleKey,
+            stroke: 'transparent',
+            width: 0,
+            fill: 'transparent',
+            spanGaps: false,
+            points: { show: false },
+            value: () => '',
+          });
+          colArrays.push(upper);
+
+          bands.push({
+            series: [upperIndex, lowerIndex],
+            fill: withAlpha(color, 0.13),
+          });
+        }
+
         if (showRawPoints) {
           seriesConfigs.push({
-            label: `${keyLabel} (points)`,
+            label: formatLossSeriesLabel(key, 'points'),
             scale: scaleKey,
             stroke: color,
             width: 1,
@@ -538,18 +557,19 @@ export default function JobLossGraph({ job }: Props) {
           colArrays.push(raw);
         }
 
-        if (showMovingAverage && visiblePointCount >= 2) {
-          data.push(movingAverage);
+        if (showMa) {
+          data.push(movingStats.mean);
           seriesConfigs.push({
-            label: keyLabel,
+            label: formatLossSeriesLabel(key, 'ma'),
             scale: scaleKey,
-            stroke: colorDull,
+            stroke: color,
             width: 2,
+            dash: variantDash,
             spanGaps: true,
             points: { show: false },
             value: (_u, value) => formatNum(value),
           });
-          colArrays.push(movingAverage);
+          colArrays.push(movingStats.mean);
         }
       }
 
@@ -609,7 +629,7 @@ export default function JobLossGraph({ job }: Props) {
       }
     }
 
-    return { data: data as uPlot.AlignedData, seriesConfigs, scales, axes, yClip };
+    return { data: data as uPlot.AlignedData, seriesConfigs, scales, axes, bands, yClip };
   }, [
     series,
     activeKeys,
@@ -622,8 +642,11 @@ export default function JobLossGraph({ job }: Props) {
     useLogScale,
     showMovingAverage,
     showRawPoints,
+    showConfidenceBand,
     clipOutliers,
     keyLabelByKey,
+    colorByKey,
+    trendDashByKey,
   ]);
 
   // Layout wrapper we measure for sizing — uPlot collapses its own mount node
@@ -648,8 +671,17 @@ export default function JobLossGraph({ job }: Props) {
   // axis distribution changes. Data updates go through setData.
   const hasData = (built.data[0]?.length ?? 0) > 1;
   const structuralKey = useMemo(
-    () => `${activeKeys.join('|')}|mode=${smoothingMode}|trend=${showTrend}|ma=${showMovingAverage}|pts=${showRawPoints}|log=${useLogScale}|has=${hasData}`,
-    [activeKeys, smoothingMode, showTrend, showMovingAverage, showRawPoints, useLogScale, hasData],
+    () => `${activeKeys.join('|')}|mode=${smoothingMode}|trend=${showTrend}|ma=${showMovingAverage}|pts=${showRawPoints}|ci=${showConfidenceBand && smoothingMode === 'ma' && showMovingAverage}|log=${useLogScale}|has=${hasData}`,
+    [
+      activeKeys,
+      smoothingMode,
+      showTrend,
+      showMovingAverage,
+      showRawPoints,
+      showConfidenceBand,
+      useLogScale,
+      hasData,
+    ],
   );
 
   useEffect(() => {
@@ -670,6 +702,7 @@ export default function JobLossGraph({ job }: Props) {
       series: built.seriesConfigs,
       scales: built.scales,
       axes: built.axes,
+      bands: built.bands,
       cursor: {
         drag: { x: true, y: false, setScale: true },
         points: { size: 6 },
@@ -860,8 +893,116 @@ export default function JobLossGraph({ job }: Props) {
 
       {/* Controls */}
       <div className="px-4 pb-2 shrink-0">
+        <div className="bg-gray-950 border border-gray-800 rounded-lg mb-3">
+          <button
+            type="button"
+            onClick={() => setSeriesPanelOpen(value => !value)}
+            className="flex w-full items-center justify-between gap-3 p-3 text-left"
+            aria-expanded={seriesPanelOpen}
+            aria-controls="loss-series-panel"
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="text-xs text-gray-400">Series</span>
+              <span className="truncate text-xs text-gray-300">
+                {activeKeys.length} of {visibleLossKeys.length} shown
+              </span>
+              <span className="hidden truncate text-[11px] text-gray-500 sm:inline">
+                {activeKeys
+                  .slice(0, 4)
+                  .map(key => keyLabelByKey[key] ?? key)
+                  .join(', ')}
+                {activeKeys.length > 4 ? ` +${activeKeys.length - 4}` : ''}
+              </span>
+            </span>
+            <ChevronDown
+              className={classNames(
+                'h-4 w-4 shrink-0 text-gray-400 transition-transform',
+                seriesPanelOpen ? 'rotate-180' : '',
+              )}
+            />
+          </button>
+
+          {seriesPanelOpen && (
+            <div id="loss-series-panel" className="border-t border-gray-800 p-3">
+              {visibleLossKeys.length === 0 ? (
+                <div className="text-sm text-gray-400">No loss keys found yet.</div>
+              ) : (
+                <>
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-gray-500">Click a series to show or hide it.</span>
+                    <div className="flex gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEnabled(prev => {
+                            const next = { ...prev };
+                            for (const key of visibleLossKeys) next[key] = true;
+                            return next;
+                          })
+                        }
+                        className="rounded border border-gray-700 px-2 py-0.5 text-[11px] text-gray-300 hover:bg-gray-800"
+                      >
+                        All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEnabled(prev => {
+                            const next = { ...prev };
+                            for (const key of visibleLossKeys) next[key] = false;
+                            return next;
+                          })
+                        }
+                        className="rounded border border-gray-700 px-2 py-0.5 text-[11px] text-gray-300 hover:bg-gray-800"
+                      >
+                        None
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid max-h-64 grid-cols-1 gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2 xl:grid-cols-3">
+                    {visibleLossKeys.map(key => {
+                      const selected = isSeriesSelected(key);
+                      const color = colorByKey[key] ?? seriesColor(0);
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          onClick={() => setEnabled(prev => ({ ...prev, [key]: !isSeriesSelected(key) }))}
+                          className={classNames(
+                            'flex min-w-0 items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors',
+                            selected
+                              ? 'bg-gray-800/70 text-gray-100 border-gray-600'
+                              : 'bg-gray-900/40 text-gray-500 border-gray-800 hover:text-gray-300 hover:border-gray-700',
+                          )}
+                          style={
+                            selected
+                              ? { borderColor: withAlpha(color, 0.65), backgroundColor: withAlpha(color, 0.12) }
+                              : undefined
+                          }
+                          aria-pressed={selected}
+                          title={key}
+                        >
+                          <span
+                            className={classNames(
+                              'h-2.5 w-2.5 shrink-0 rounded-full border',
+                              selected ? 'border-transparent' : 'bg-transparent',
+                            )}
+                            style={{ backgroundColor: selected ? color : 'transparent', borderColor: color }}
+                          />
+                          <span className="min-w-0 flex-1 truncate">{keyLabelByKey[key] ?? key}</span>
+                          {selected && <Check className="h-3.5 w-3.5 shrink-0" style={{ color }} />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
+          <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 md:col-span-2">
             <label className="block text-xs text-gray-400 mb-2">Display</label>
             <div className="flex flex-wrap gap-2">
               <ToggleButton checked={smoothingMode === 'ema'} onClick={() => setSmoothingMode('ema')} label="EMA" />
@@ -884,6 +1025,12 @@ export default function JobLossGraph({ job }: Props) {
                     onClick={() => setShowMovingAverage(v => (showRawPoints ? !v : true))}
                     label="MA line"
                   />
+                  <ToggleButton
+                    checked={showConfidenceBand && showMovingAverage}
+                    onClick={() => setShowConfidenceBand(v => !v)}
+                    label="95% CI"
+                    disabled={!showMovingAverage}
+                  />
                 </>
               )}
               <ToggleButton checked={showRawSeries} onClick={() => setShowRawSeries(v => !v)} label="Show raw series" />
@@ -894,59 +1041,67 @@ export default function JobLossGraph({ job }: Props) {
           </div>
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
-            <label className="block text-xs text-gray-400 mb-2">Series</label>
-            {visibleLossKeys.length === 0 ? (
-              <div className="text-sm text-gray-400">No loss keys found yet.</div>
+            {smoothingMode === 'ema' ? (
+              <>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs text-gray-400">EMA smoothing</label>
+                  <span className="text-xs text-gray-300">{emaSmoothing}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={emaSmoothing}
+                  onChange={e => setEmaSmoothing(Number(e.target.value))}
+                  className="w-full accent-blue-500"
+                />
+                <div className="mt-2 text-[11px] text-gray-500">
+                  EMA is forward/backward (retrospective) with optional trend overlay. 95% CI bands are available in
+                  Moving Average mode.
+                </div>
+              </>
             ) : (
-              <div className="flex flex-wrap gap-2">
-                {visibleLossKeys.map(k => (
-                  <button
-                    key={k}
-                    type="button"
-                    onClick={() => setEnabled(prev => ({ ...prev, [k]: !(prev[k] ?? true) }))}
-                    className={[
-                      'px-3 py-1 rounded-md text-xs border transition-colors',
-                      enabled[k] === false
-                        ? 'bg-gray-900 text-gray-400 border-gray-800 hover:bg-gray-800/60'
-                        : 'bg-gray-900 text-gray-200 border-gray-800 hover:bg-gray-800/60',
-                    ].join(' ')}
-                    aria-pressed={enabled[k] !== false}
-                    title={k}
-                  >
-                    <span className="inline-block h-2 w-2 rounded-full mr-2" style={{ background: colorByKey[k] }} />
-                    {keyLabelByKey[k] ?? k}
-                  </button>
-                ))}
-              </div>
+              <>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <label className="block text-xs text-gray-400">Moving average window</label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      min={MA_WINDOW_MIN}
+                      max={MA_WINDOW_MAX}
+                      value={maInput}
+                      onChange={e => setMaInput(e.target.value)}
+                      onBlur={commitMaInput}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.currentTarget.blur();
+                        }
+                      }}
+                      className="w-20 rounded border border-gray-700 bg-gray-900 px-2 py-0.5 text-right text-xs text-gray-200 focus:border-transparent focus:ring-2 focus:ring-gray-600"
+                      aria-label="Moving average window in points"
+                    />
+                    <span className="text-xs text-gray-300">pts</span>
+                  </div>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={1000}
+                  value={maWindowToSlider(maWindow)}
+                  onChange={e => setMaWindow(sliderToMaWindow(Number(e.target.value)))}
+                  className="w-full accent-blue-500"
+                  aria-label="Moving average window"
+                />
+                <div className="flex justify-between text-[10px] text-gray-500">
+                  <span>{MA_WINDOW_MIN} pts</span>
+                  <span>{MA_WINDOW_MAX.toLocaleString()} pts</span>
+                </div>
+                <div className="mt-1 text-[11px] text-gray-500">
+                  Trailing MA over recent points. It uses an expanding mean until the window fills, so a window wider
+                  than the run stays visible. 95% CI is the standard error of the windowed mean.
+                </div>
+              </>
             )}
-          </div>
-
-          <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
-            <div className="flex items-center justify-between mb-1">
-              <label className="block text-xs text-gray-400">
-                {smoothingMode === 'ema' ? 'EMA smoothing' : 'Moving average window'}
-              </label>
-              <span className="text-xs text-gray-300">
-                {smoothingMode === 'ema' ? `${emaSmoothing}%` : `${maWindow} pts`}
-              </span>
-            </div>
-            <input
-              type="range"
-              min={smoothingMode === 'ema' ? 0 : 2}
-              max={smoothingMode === 'ema' ? 100 : 200}
-              value={smoothingMode === 'ema' ? emaSmoothing : maWindow}
-              onChange={e => {
-                const value = Number(e.target.value);
-                if (smoothingMode === 'ema') setEmaSmoothing(value);
-                else setMaWindow(value);
-              }}
-              className="w-full accent-blue-500"
-            />
-            <div className="mt-2 text-[11px] text-gray-500">
-              {smoothingMode === 'ema'
-                ? 'EMA is forward/backward (retrospective) with optional trend overlay.'
-                : 'Central tendency uses trailing MA (causal); line starts after full window warmup.'}
-            </div>
           </div>
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
@@ -984,6 +1139,9 @@ export default function JobLossGraph({ job }: Props) {
         .uplot .u-legend .u-marker {
           border-radius: 2px;
         }
+        .uplot .u-legend tr.u-ci-band {
+          display: none;
+        }
         .uplot .u-select {
           background: rgba(59, 130, 246, 0.15);
           border: 1px solid rgba(59, 130, 246, 0.4);
@@ -993,16 +1151,28 @@ export default function JobLossGraph({ job }: Props) {
   );
 }
 
-function ToggleButton({ checked, onClick, label }: { checked: boolean; onClick: () => void; label: string }) {
+function ToggleButton({
+  checked,
+  onClick,
+  label,
+  disabled,
+}: {
+  checked: boolean;
+  onClick: () => void;
+  label: string;
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       className={[
         'px-3 py-1 rounded-md text-xs border transition-colors',
         checked
           ? 'bg-blue-500/10 text-blue-300 border-blue-500/30 hover:bg-blue-500/15'
           : 'bg-gray-900 text-gray-300 border-gray-800 hover:bg-gray-800/60',
+        disabled ? 'opacity-40 cursor-not-allowed' : '',
       ].join(' ')}
       aria-pressed={checked}
     >
