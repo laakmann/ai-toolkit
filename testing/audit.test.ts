@@ -193,6 +193,21 @@ test('global perceptual_restrict_to_body is reported as unimplemented', () => {
   assert.ok(issues.some(issue => issue.id === 'global.subject_mask.perceptual_restrict_to_body.unsupported'));
 });
 
+test('fractional num repeats is accepted', () => {
+  const issues = auditJobConfig({ config: baseConfig({ dataset: { num_repeats: 0.5 } }), arch });
+  assert.ok(!issues.some(issue => issue.id.includes('num_repeats.invalid')));
+});
+
+test('zero num repeats is an error', () => {
+  const issues = auditJobConfig({ config: baseConfig({ dataset: { num_repeats: 0 } }), arch });
+  assert.ok(issues.some(issue => issue.id.includes('num_repeats.invalid') && issue.severity === 'error'));
+});
+
+test('list num repeats is an error', () => {
+  const issues = auditJobConfig({ config: baseConfig({ dataset: { num_repeats: [1, 2] } }), arch });
+  assert.ok(issues.some(issue => issue.id.includes('num_repeats.invalid') && issue.severity === 'error'));
+});
+
 test('countIssues groups by severity', () => {
   const counts = countIssues([
     { id: 'a', path: '', severity: 'error', section: '', target: '', title: '', message: '' },

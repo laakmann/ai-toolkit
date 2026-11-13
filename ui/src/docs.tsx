@@ -335,10 +335,11 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Num Repeats',
     description: (
       <>
-        Number of Repeats will allow you to repeate the items in a dataset multiple times. This is useful when you are
-        using multiple datasets and want to balance the number of samples from each dataset. For instance, if you have a
-        small dataset of 10 images and a large dataset of 100 images, you can set the small dataset to have 10 repeats
-        to effectively make it 100 images, making the two datasets occour equally during training.
+        Number of Repeats controls how often images from this dataset are sampled relative to the other datasets.
+        Whole numbers repeat the file list exactly: a small dataset of 10 images with 10 repeats is sampled as often
+        as a 100 image dataset with 1 repeat. Fractional values are also supported: 0.5 samples every image half as
+        often, and 1.5 samples every image 50% more often. Fractional weights use a weighted sampler, so all images
+        remain eligible and none are dropped. The value must be greater than zero.
       </>
     ),
   },

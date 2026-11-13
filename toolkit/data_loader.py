@@ -13,7 +13,7 @@ import torch
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
 from tqdm import tqdm
 import albumentations as A
 
@@ -26,6 +26,23 @@ from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
 
 import platform
+
+
+def repeats_to_copies_and_weight(num_repeats: float) -> tuple[int, float]:
+    """Split a repeat count into list copies plus a per-entry sampler weight.
+
+    Whole repeats are handled by duplicating the file list (so integer jobs keep
+    the exact one-pass-per-epoch behavior). A fractional remainder cannot be
+    expressed as a list length, so each entry gets a weight used by a
+    WeightedRandomSampler. The expected number of draws is
+    ``copies * weight = num_repeats`` per image.
+    """
+    repeats = float(num_repeats)
+    if repeats <= 0:
+        raise ValueError(f"num_repeats must be greater than 0, got {num_repeats!r}")
+    # At least one copy is built so sub-1 values can still be weighted.
+    copies = max(1, int(repeats))
+    return copies, repeats / copies
 
 def is_native_windows():
     return platform.system() == "Windows" and platform.release() != "2"
@@ -505,9 +522,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
-        if dataset_config.num_repeats > 1:
+        copies, repeat_weight = repeats_to_copies_and_weight(dataset_config.num_repeats)
+        if copies > 1:
             # repeat the list
-            file_list = file_list * dataset_config.num_repeats
+            file_list = file_list * copies
 
         # this might take a while
         print_acc(f"Dataset: {dataset_path}")
@@ -573,6 +591,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     temporal_compression=temporal_compression,
                     sample_rate=self.sd.sample_rate if (self.is_audio_model or self.is_multimodal_llm) and self.sd is not None else 48000,
                 )
+                # Weighted sampler uses this when any dataset has a fractional
+                # repeat count. 1.0 for whole-number repeats (the common case).
+                file_item.repeat_weight = repeat_weight
                 source_items.append(file_item)
             except Exception as e:
                 print_acc(traceback.format_exc())
@@ -711,6 +732,28 @@ def dto_collation(batch: List['FileItemDTO']):
     )
 
 
+def build_repeat_weights(datasets) -> List[float]:
+    """Per-index sampling weights for a concatenated dataset.
+
+    Without buckets each index is one image. With buckets each index is a batch
+    built by the dataset, so its weight is the mean weight of the batch's items.
+    Whole-number repeats produce weight 1.0 and never reach this path.
+    """
+    weights: List[float] = []
+    for dataset in datasets:
+        if dataset.dataset_config.buckets:
+            for batch in dataset.batch_indices:
+                batch_weights = [
+                    float(getattr(dataset.file_list[i], 'repeat_weight', 1.0))
+                    for i in batch
+                ]
+                weights.append(sum(batch_weights) / max(1, len(batch_weights)))
+        else:
+            for item in dataset.file_list:
+                weights.append(float(getattr(item, 'repeat_weight', 1.0)))
+    return weights
+
+
 def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
@@ -767,6 +810,27 @@ def get_dataloader_from_datasets(
 
     concatenated_dataset = ConcatDataset(datasets)
 
+    # Fractional repeats cannot be expressed as file-list duplication, so use a
+    # weighted sampler. Whole-number repeats keep the old exact-shuffle path.
+    use_weighted_sampler = any(
+        not float(config.num_repeats).is_integer() for config in dataset_config_list
+    )
+    sampler = None
+    if use_weighted_sampler:
+        weights = build_repeat_weights(datasets)
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            raise ValueError("num_repeats resolved to no sampling weight")
+        sampler = WeightedRandomSampler(
+            weights,
+            num_samples=max(1, int(round(total_weight))),
+            replacement=True,
+        )
+        print_acc(
+            f"Using weighted sampling for fractional num_repeats: "
+            f"{len(weights)} entries, {sampler.num_samples} draws per epoch"
+        )
+
     # todo build scheduler that can get buckets from all datasets that match
     # todo and evenly distribute reg images
 
@@ -801,6 +865,8 @@ def get_dataloader_from_datasets(
     if torch.cuda.is_available() and dataset_config_list[0].pin_memory:
         dataloader_kwargs['pin_memory'] = True
 
+    index_kwargs = {'sampler': sampler} if sampler is not None else {'shuffle': True}
+
     if has_buckets:
         # make sure they all have buckets
         for dataset in datasets:
@@ -810,8 +876,8 @@ def get_dataloader_from_datasets(
             concatenated_dataset,
             batch_size=None,  # we batch in the datasets for now
             drop_last=False,
-            shuffle=True,
             collate_fn=dto_collation,  # Use the custom collate function
+            **index_kwargs,
             **dataloader_kwargs
         )
     else:
@@ -825,8 +891,8 @@ def get_dataloader_from_datasets(
         data_loader = DataLoader(
             concatenated_dataset,
             batch_size=batch_size,
-            shuffle=True,
             collate_fn=dto_collation,
+            **index_kwargs,
             **dataloader_kwargs
         )
     return data_loader

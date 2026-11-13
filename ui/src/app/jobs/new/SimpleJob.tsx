@@ -1344,10 +1344,11 @@ export default function SimpleJob({
                       />
                       <NumberInput
                         label="Num Repeats"
-                        value={dataset.num_repeats || 1}
+                        value={dataset.num_repeats ?? 1}
                         className="pt-2"
+                        min={0.01}
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].num_repeats`)}
-                        placeholder="eg. 1"
+                        placeholder="eg. 1 or 0.5"
                         docKey={'dataset.num_repeats'}
                       />
                       <NumberInput

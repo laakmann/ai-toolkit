@@ -2,6 +2,7 @@ import os
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
+import math
 
 import torch
 import torchaudio
@@ -1155,7 +1156,22 @@ class DatasetConfig:
         if self.poi is not None:
             raise ValueError("poi is deprecated and is no longer supported")
         self.use_short_captions: bool = kwargs.get('use_short_captions', False)  # if true, will use 'caption_short' from json
-        self.num_repeats: int = kwargs.get('num_repeats', 1)  # number of times to repeat dataset
+        # Number of times to repeat this dataset. Whole numbers repeat the file
+        # list exactly; fractional values (e.g. 0.5, 1.5) are supported by a
+        # weighted sampler, so every image is still eligible but sampled less or
+        # more often. Must be greater than zero.
+        num_repeats = kwargs.get('num_repeats', 1)
+        if num_repeats is None:
+            num_repeats = 1
+        if isinstance(num_repeats, bool) or not isinstance(num_repeats, (int, float)):
+            raise ValueError(
+                f"num_repeats must be a number, got {num_repeats!r}. "
+                "Use a whole number, or a fraction such as 0.5 or 1.5."
+            )
+        num_repeats = float(num_repeats)
+        if not math.isfinite(num_repeats) or num_repeats <= 0:
+            raise ValueError(f"num_repeats must be greater than 0, got {num_repeats!r}")
+        self.num_repeats: float = num_repeats
         # cache latents will store them in memory
         self.cache_latents: bool = kwargs.get('cache_latents', False)
         # cache latents to disk will store them on disk. If both are true, it will save to disk, but keep in memory
@@ -1329,7 +1345,9 @@ def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
             path_split_config.append(dataset)
     raw_config = path_split_config
 
-    # split up datasets by resolutions
+    # split up datasets by resolutions. A num_repeats list pairs with the
+    # resolution list, so [512, 768, 1024] + [16, 4, 1] gives each resolution
+    # its own repeat count.
     new_config = []
     for dataset in raw_config:
         resolution = dataset.get('resolution', 512)
@@ -1337,9 +1355,18 @@ def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
             resolution_list = resolution
         else:
             resolution_list = [resolution]
-        for res in resolution_list:
+        repeats = dataset.get('num_repeats', 1)
+        repeats_list = repeats if isinstance(repeats, (list, tuple)) else None
+        if repeats_list is not None and len(repeats_list) != len(resolution_list):
+            raise ValueError(
+                f"num_repeats has {len(repeats_list)} values but resolution has "
+                f"{len(resolution_list)}. Use one num_repeats value per resolution."
+            )
+        for i, res in enumerate(resolution_list):
             dataset_copy = dataset.copy()
             dataset_copy['resolution'] = res
+            if repeats_list is not None:
+                dataset_copy['num_repeats'] = repeats_list[i]
             new_config.append(dataset_copy)
     return new_config
 

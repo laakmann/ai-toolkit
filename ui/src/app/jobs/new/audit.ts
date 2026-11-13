@@ -753,6 +753,33 @@ export function auditJobConfig({ config, arch }: AuditContext): AuditIssue[] {
   // ---------------------------------------------------------
   datasets.forEach((dataset, index) => {
     const label = datasetLabel(dataset, index);
+    if (hasValue(dataset, 'num_repeats')) {
+      const rawRepeats = (dataset as any).num_repeats;
+      const repeats = typeof rawRepeats === 'number' && Number.isFinite(rawRepeats) ? rawRepeats : null;
+      if (repeats === null) {
+        add({
+          id: `dataset.${index}.num_repeats.invalid`,
+          path: `datasets[${index}].num_repeats`,
+          severity: 'error',
+          section: label,
+          target: `dataset-${index}`,
+          title: 'Num repeats must be a single number',
+          message:
+            'Use a positive number. A list is only valid in a YAML config when paired one-to-one with a resolution list.',
+        });
+      } else if (!(repeats > 0)) {
+        add({
+          id: `dataset.${index}.num_repeats.invalid`,
+          path: `datasets[${index}].num_repeats`,
+          severity: 'error',
+          section: label,
+          target: `dataset-${index}`,
+          title: 'Num repeats must be greater than zero',
+          message: 'Use a whole number, or a fraction such as 0.5 or 1.5, to weight sampling.',
+        });
+      }
+    }
+
     if (hasValue(dataset, 'batch_size') && dataset.buckets === false) {
       add({
         id: `dataset.${index}.batch_size.no_buckets`,
