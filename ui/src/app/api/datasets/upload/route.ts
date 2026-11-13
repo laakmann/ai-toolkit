@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { writeFile, mkdir } from 'fs/promises';
 import path, { join } from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+import { invalidateDatasetStatsCache } from '@/server/datasetStats';
 
 export async function POST(request: NextRequest) {
   try {
@@ -45,6 +46,8 @@ export async function POST(request: NextRequest) {
       await writeFile(filePath, buffer);
       savedFiles.push(fileName);
     }
+
+    invalidateDatasetStatsCache(uploadDir);
 
     return NextResponse.json({
       message: 'Files uploaded successfully',

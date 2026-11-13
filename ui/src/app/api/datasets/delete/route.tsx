@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+import { invalidateDatasetStatsCache } from '@/server/datasetStats';
 
 export async function POST(request: Request) {
   try {
@@ -25,6 +26,7 @@ export async function POST(request: Request) {
 
     // delete it and return success
     fs.rmSync(datasetPath, { recursive: true, force: true });
+    invalidateDatasetStatsCache(datasetPath);
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json({ error: 'Failed to delete dataset' }, { status: 500 });

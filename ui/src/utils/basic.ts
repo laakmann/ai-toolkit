@@ -50,6 +50,16 @@ export const getFoldername = (filePath: string) => {
   return idx === -1 ? '' : filePath.slice(0, idx);
 };
 
+/** Human-readable byte size using binary units (e.g. 1.4 GB). */
+export const formatBytes = (bytes: number | null | undefined) => {
+  if (bytes == null || !Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const unitIndex = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const value = bytes / Math.pow(1024, unitIndex);
+  const digits = unitIndex === 0 ? 0 : value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
+};
+
 /**
  * Encode an absolute file path for /api/files/ and /api/img/ URLs as
  * `<encoded folder>/<encoded filename>` — two URL segments, so the last one is

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
+import { invalidateDatasetStatsCache } from '@/server/datasetStats';
 
 const fileExists = (p: string) => fs.promises.access(p).then(() => true).catch(() => false);
 
@@ -35,6 +36,8 @@ export async function POST(request: Request) {
       // delete caption file
       await fs.promises.unlink(captionPath);
     }
+
+    invalidateDatasetStatsCache();
 
     return NextResponse.json({ success: true });
   } catch (error) {

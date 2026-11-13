@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import { getDatasetsRoot } from '@/server/settings';
+import { invalidateDatasetStatsCache } from '@/server/datasetStats';
 
 export async function POST(request: Request) {
   try {
@@ -24,6 +25,7 @@ export async function POST(request: Request) {
     const captionPath = imgPath.replace(/\.[^/.]+$/, '') + '.' + captionExt;
     // save caption to file
     await fs.promises.writeFile(captionPath, caption);
+    invalidateDatasetStatsCache();
 
     return NextResponse.json({ success: true });
   } catch (error) {

@@ -11,7 +11,8 @@ import AddImagesModal, { openImagesModal, useOpenImagesModalOnDrag } from '@/com
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 import useSettings from '@/hooks/useSettings';
-import { pathJoin } from '@/utils/basic';
+import { pathJoin, formatBytes } from '@/utils/basic';
+import type { DatasetStats } from '@/hooks/useDatasetStats';
 import AutoCaptionButton from '@/components/AutoCaptionButton';
 import DatasetActionBar from '@/components/DatasetActionBar';
 import CaptionMonitor from '@/components/CaptionMonitor';
@@ -19,6 +20,7 @@ import { CreatableSelectInput } from '@/components/formInputs';
 
 export default function DatasetPage({ params }: { params: { datasetName: string } }) {
   const [imgList, setImgList] = useState<{ img_path: string }[]>([]);
+  const [datasetStats, setDatasetStats] = useState<Omit<DatasetStats, 'name'> | null>(null);
   const [isAutoCaptioning, setIsAutoCaptioning] = useState(false);
   const usableParams = use(params as any) as { datasetName: string };
   const datasetName = usableParams.datasetName;
@@ -46,6 +48,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         // Server already sorts; avoid a client-side sort on large lists.
         const root = data.root;
         setImgList(data.images.map((subPath: string) => ({ img_path: root + subPath })));
+        setDatasetStats(data.stats ?? null);
         setStatus('success');
       })
       .catch(error => {
@@ -167,6 +170,54 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         className="transition-[bottom] duration-300"
         style={{ bottom: `${captionBarHeight}px` }}
       >
+        {datasetStats && (() => {
+          const captionCount =
+            datasetStats.caption_counts[captionExt as keyof DatasetStats['caption_counts']] ?? 0;
+          const coverage =
+            datasetStats.image_count > 0 ? `${((captionCount / datasetStats.image_count) * 100).toFixed(1)}%` : '0.0%';
+          const otherBytes = Math.max(
+            0,
+            datasetStats.total_size_bytes - datasetStats.media_size_bytes - datasetStats.caption_size_bytes,
+          );
+          return (
+            <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-gray-800 bg-gray-900 px-3 py-2 text-sm">
+              <span>
+                <span className="text-gray-400">Images:</span>{' '}
+                <span className="text-gray-200">{datasetStats.image_count.toLocaleString()}</span>
+              </span>
+              {datasetStats.video_count > 0 && (
+                <span>
+                  <span className="text-gray-400">Videos:</span>{' '}
+                  <span className="text-gray-200">{datasetStats.video_count.toLocaleString()}</span>
+                </span>
+              )}
+              {datasetStats.audio_count > 0 && (
+                <span>
+                  <span className="text-gray-400">Audio:</span>{' '}
+                  <span className="text-gray-200">{datasetStats.audio_count.toLocaleString()}</span>
+                </span>
+              )}
+              <span>
+                <span className="text-gray-400">Captions ({captionExt}):</span>{' '}
+                <span className="text-gray-200">
+                  {captionCount.toLocaleString()} ({coverage})
+                </span>
+              </span>
+              <span
+                title={`Media: ${formatBytes(datasetStats.media_size_bytes)} · Captions: ${formatBytes(
+                  datasetStats.caption_size_bytes,
+                )} · Other: ${formatBytes(otherBytes)}`}
+              >
+                <span className="text-gray-400">Size:</span>{' '}
+                <span className="text-gray-200">{formatBytes(datasetStats.total_size_bytes)}</span>
+              </span>
+              <span className="text-xs text-gray-500">
+                Media {formatBytes(datasetStats.media_size_bytes)} · Captions{' '}
+                {formatBytes(datasetStats.caption_size_bytes)}
+              </span>
+            </div>
+          );
+        })()}
         {PageInfoContent}
         {status === 'success' && imgList.length > 0 && scrollParent && (
           <VirtuosoGrid

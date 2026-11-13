@@ -1,28 +1,43 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Modal } from '@/components/Modal';
 import Link from 'next/link';
 import { TextInput } from '@/components/formInputs';
 import useDatasetList from '@/hooks/useDatasetList';
+import useDatasetStats from '@/hooks/useDatasetStats';
 import { Button } from '@headlessui/react';
 import { FaRegTrashAlt } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import { TopBar, MainContent } from '@/components/layout';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
 import { apiClient } from '@/utils/api';
+import { formatBytes } from '@/utils/basic';
 import { useRouter } from 'next/navigation';
 
 export default function Datasets() {
   const router = useRouter();
   const { datasets, status, refreshDatasets } = useDatasetList();
+  const { datasetStats, status: statsStatus, refreshDatasetStats } = useDatasetStats({ includeSizes: true });
   const [newDatasetName, setNewDatasetName] = useState('');
   const [isNewDatasetModalOpen, setIsNewDatasetModalOpen] = useState(false);
+
+  const statsByName = useMemo(() => {
+    const map: Record<string, (typeof datasetStats)[number]> = {};
+    for (const stats of datasetStats) map[stats.name] = stats;
+    return map;
+  }, [datasetStats]);
+
+  const refreshAll = () => {
+    refreshDatasets();
+    refreshDatasetStats({ refresh: true });
+  };
 
   // Transform datasets array into rows with objects
   const tableRows = datasets.map(dataset => ({
     name: dataset,
     actions: dataset, // Pass full dataset name for actions
+    stats: statsByName[dataset] ?? null,
   }));
 
   const columns: TableColumn[] = [
@@ -34,6 +49,62 @@ export default function Datasets() {
           {row.name}
         </Link>
       ),
+    },
+    {
+      title: 'Images',
+      key: 'images',
+      className: 'whitespace-nowrap',
+      render: row => {
+        const stats = row.stats;
+        if (!stats) return <span className="text-gray-500">{statsStatus === 'loading' ? '…' : '—'}</span>;
+        const extraMedia = [
+          stats.video_count > 0 ? `${stats.video_count.toLocaleString()} video${stats.video_count === 1 ? '' : 's'}` : null,
+          stats.audio_count > 0 ? `${stats.audio_count.toLocaleString()} audio` : null,
+        ].filter(Boolean);
+        return (
+          <div>
+            <div className="text-gray-200">{stats.image_count.toLocaleString()}</div>
+            {extraMedia.length > 0 && <div className="text-xs text-gray-500">{extraMedia.join(' · ')}</div>}
+          </div>
+        );
+      },
+    },
+    {
+      title: 'Captions',
+      key: 'captions',
+      className: 'whitespace-nowrap',
+      render: row => {
+        const stats = row.stats;
+        if (!stats) return <span className="text-gray-500">{statsStatus === 'loading' ? '…' : '—'}</span>;
+        const counts = stats.caption_counts;
+        const total = counts.txt + counts.json + counts.caption;
+        return (
+          <span
+            className="text-gray-200"
+            title={`txt: ${counts.txt.toLocaleString()} · json: ${counts.json.toLocaleString()} · caption: ${counts.caption.toLocaleString()}`}
+          >
+            {total.toLocaleString()}
+          </span>
+        );
+      },
+    },
+    {
+      title: 'Size',
+      key: 'size',
+      className: 'whitespace-nowrap',
+      render: row => {
+        const stats = row.stats;
+        if (!stats) return <span className="text-gray-500">{statsStatus === 'loading' ? '…' : '—'}</span>;
+        const otherBytes = Math.max(0, stats.total_size_bytes - stats.media_size_bytes - stats.caption_size_bytes);
+        return (
+          <span
+            className="text-gray-200"
+            title={`Media: ${formatBytes(stats.media_size_bytes)} · Captions: ${formatBytes(stats.caption_size_bytes)} · Other: ${formatBytes(otherBytes)}`}
+          >
+            {formatBytes(stats.total_size_bytes)}
+          </span>
+        );
+      },
     },
     {
       title: 'Actions',
@@ -61,7 +132,7 @@ export default function Datasets() {
           .post('/api/datasets/delete', { name: datasetName })
           .then(() => {
             console.log('Dataset deleted:', datasetName);
-            refreshDatasets();
+            refreshAll();
           })
           .catch(error => {
             console.error('Error deleting dataset:', error);
@@ -75,7 +146,7 @@ export default function Datasets() {
     try {
       const data = await apiClient.post('/api/datasets/create', { name: newDatasetName }).then(res => res.data);
       console.log('New dataset created:', data);
-      refreshDatasets();
+      refreshAll();
       setNewDatasetName('');
       setIsNewDatasetModalOpen(false);
     } catch (error) {
@@ -101,7 +172,7 @@ export default function Datasets() {
           if (data.name) {
             router.push(`/datasets/${data.name}`);
           } else {
-            refreshDatasets();
+            refreshAll();
           }
         } catch (error) {
           console.error('Error creating new dataset:', error);
@@ -117,7 +188,14 @@ export default function Datasets() {
           <h1 className="text-base sm:text-lg">Datasets</h1>
         </div>
         <div className="flex-1"></div>
-        <div>
+        <div className="flex items-center gap-2">
+          <Button
+            className="text-gray-200 bg-gray-700 px-2 sm:px-3 py-1 rounded-md hover:bg-gray-600 transition-colors text-sm sm:text-base whitespace-nowrap"
+            onClick={refreshAll}
+            disabled={statsStatus === 'loading' || status === 'loading'}
+          >
+            Refresh
+          </Button>
           <Button
             className="text-white bg-slate-600 px-2 sm:px-3 py-1 rounded-md hover:bg-slate-500 transition-colors text-sm sm:text-base whitespace-nowrap"
             onClick={() => openNewDatasetModal()}
@@ -133,7 +211,7 @@ export default function Datasets() {
           columns={columns}
           rows={tableRows}
           isLoading={status === 'loading'}
-          onRefresh={refreshDatasets}
+          onRefresh={refreshAll}
         />
       </MainContent>
 
