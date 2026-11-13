@@ -275,6 +275,39 @@ export function shouldShowObservationKnots(
   return observedCount < plottedCount * 0.9;
 }
 
+/**
+ * True when a selected x-range reaches the newest observation. One pixel of
+ * slack (converted to data units) keeps a drag to the right edge counting as
+ * "at the tail" despite pointer rounding.
+ */
+export function selectionEndsAtTail(
+  selectionMax: number | null,
+  firstStep: number | null,
+  lastStep: number | null,
+  plotWidthPx: number,
+): boolean {
+  if (selectionMax == null || lastStep == null) return false;
+  if (firstStep == null || lastStep <= firstStep) return selectionMax >= lastStep;
+  const tolerance = (lastStep - firstStep) / Math.max(1, plotWidthPx);
+  return selectionMax >= lastStep - tolerance;
+}
+
+/**
+ * New x-range for a tail-locked selection: the left edge stays put and the
+ * right edge grows to the newest step. Returns null when there is nothing new
+ * to reveal, so callers can leave the current scale alone.
+ */
+export function followTailRange(
+  selectionMin: number | null,
+  previousLast: number | null,
+  nextLast: number | null,
+): { min: number; max: number } | null {
+  if (selectionMin == null || nextLast == null) return null;
+  if (previousLast != null && nextLast <= previousLast) return null;
+  if (selectionMin >= nextLast) return null;
+  return { min: selectionMin, max: nextLast };
+}
+
 // Tableau-style categorical palette, ordered so the first few series are
 // maximally separated on the dark chart background.
 export const SERIES_PALETTE = [

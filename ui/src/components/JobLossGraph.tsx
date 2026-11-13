@@ -15,10 +15,12 @@ import {
   clampMaWindow,
   formatLossKeyLabel,
   formatLossSeriesLabel,
+  followTailRange,
   maWindowToSlider,
   metricDash,
   observationKnots,
   parseLossKey,
+  selectionEndsAtTail,
   seriesColor,
   shouldShowObservationKnots,
   sliderToMaWindow,
@@ -117,6 +119,7 @@ interface PersistedSettings {
   smoothingMode: 'ema' | 'ma';
   useLogScale: boolean;
   sharedAxis: boolean;
+  followTail: boolean;
   showRawSeries: boolean;
   showAuxSeries: boolean;
   showTrend: boolean;
@@ -159,6 +162,7 @@ export default function JobLossGraph({ job }: Props) {
   const [smoothingMode, setSmoothingMode] = useState<'ema' | 'ma'>('ema');
   const [useLogScale, setUseLogScale] = useState(false);
   const [sharedAxis, setSharedAxis] = useState(true);
+  const [followTail, setFollowTail] = useState(true);
   const [showRawSeries, setShowRawSeries] = useState(false);
   const [showAuxSeries, setShowAuxSeries] = useState(false);
   const [showTrend, setShowTrend] = useState(true);
@@ -235,6 +239,7 @@ export default function JobLossGraph({ job }: Props) {
         }
         if (typeof s.useLogScale === 'boolean') setUseLogScale(s.useLogScale);
         if (typeof s.sharedAxis === 'boolean') setSharedAxis(s.sharedAxis);
+        if (typeof s.followTail === 'boolean') setFollowTail(s.followTail);
         if (typeof s.showRawSeries === 'boolean') setShowRawSeries(s.showRawSeries);
         if (typeof s.showAuxSeries === 'boolean') setShowAuxSeries(s.showAuxSeries);
         if (typeof s.showTrend === 'boolean') setShowTrend(s.showTrend);
@@ -272,6 +277,7 @@ export default function JobLossGraph({ job }: Props) {
         smoothingMode,
         useLogScale,
         sharedAxis,
+        followTail,
         showRawSeries,
         showAuxSeries,
         showTrend,
@@ -294,6 +300,7 @@ export default function JobLossGraph({ job }: Props) {
     smoothingMode,
     useLogScale,
     sharedAxis,
+    followTail,
     showRawSeries,
     showAuxSeries,
     showTrend,
@@ -822,6 +829,13 @@ export default function JobLossGraph({ job }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [structuralKey]);
 
+  // Latest follow-tail setting, read by the data-update effect without
+  // recreating uPlot when it changes.
+  const followTailRef = useRef(followTail);
+  useEffect(() => {
+    followTailRef.current = followTail;
+  }, [followTail]);
+
   // Push new data without recreating — preserves zoom & cursor state.
   useEffect(() => {
     const u = uplotRef.current;
@@ -830,8 +844,30 @@ export default function JobLossGraph({ job }: Props) {
     // skips its commit() in that branch though, so force a redraw to actually
     // re-render the new smoothed/strided values within the zoom window.
     if (isZoomedRef.current) {
+      const prevXs = u.data[0] as number[];
+      const nextXs = built.data[0] as number[];
+      const prevFirst = prevXs.length ? prevXs[0] : null;
+      const prevLast = prevXs.length ? prevXs[prevXs.length - 1] : null;
+      const nextLast = nextXs.length ? nextXs[nextXs.length - 1] : null;
+      const sx = u.scales.x;
+
+      // A selected range whose right edge reaches the newest point keeps
+      // following the tail: the left edge stays put and the right edge grows
+      // as new observations arrive.
+      const followRange =
+        followTailRef.current &&
+        selectionEndsAtTail(sx.max, prevFirst, prevLast, u.bbox.width)
+          ? followTailRange(sx.min, prevLast, nextLast)
+          : null;
+
       u.setData(built.data, false);
-      u.redraw(true, true);
+
+      if (followRange) {
+        // setScale commits and redraws with the new data, so no extra redraw.
+        u.setScale('x', followRange);
+      } else {
+        u.redraw(true, true);
+      }
     } else {
       u.setData(built.data, true);
     }
@@ -1120,6 +1156,12 @@ export default function JobLossGraph({ job }: Props) {
               <ToggleButton checked={showAuxSeries} onClick={() => setShowAuxSeries(v => !v)} label="Show aux series" />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
               <ToggleButton checked={sharedAxis} onClick={() => setSharedAxis(v => !v)} label="Shared Y axis" />
+              <ToggleButton
+                checked={followTail}
+                onClick={() => setFollowTail(v => !v)}
+                label="Follow latest"
+                title="While a selected range reaches the newest point, grow its right edge as new observations arrive."
+              />
               <ToggleButton checked={clipOutliers} onClick={() => setClipOutliers(v => !v)} label="Clip outliers" />
             </div>
           </div>
@@ -1243,17 +1285,20 @@ function ToggleButton({
   onClick,
   label,
   disabled,
+  title,
 }: {
   checked: boolean;
   onClick: () => void;
   label: string;
   disabled?: boolean;
+  title?: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className={[
         'px-3 py-1 rounded-md text-xs border transition-colors',
         checked

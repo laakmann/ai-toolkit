@@ -6,11 +6,13 @@ import {
   MA_WINDOW_MIN,
   clampMaWindow,
   effectiveMaWindow,
+  followTailRange,
   formatLossKeyLabel,
   formatLossSeriesLabel,
   maWindowToSlider,
   observationKnots,
   parseLossKey,
+  selectionEndsAtTail,
   seriesColor,
   seriesIdentityKey,
   shouldShowObservationKnots,
@@ -124,6 +126,25 @@ test('observation dots are limited to sparse series while raw points are visible
   assert.equal(shouldShowObservationKnots(10, 10, false), true);
   assert.equal(shouldShowObservationKnots(0, 10, false), false);
   assert.equal(shouldShowObservationKnots(3, 0, false), false);
+});
+
+test('a selected range ending at the newest point is tail-locked', () => {
+  assert.equal(selectionEndsAtTail(1000, 0, 1000, 800), true);
+  // One pixel of slack at the right edge, for pointer rounding.
+  assert.equal(selectionEndsAtTail(1000 - 1000 / 800, 0, 1000, 800), true);
+  assert.equal(selectionEndsAtTail(900, 0, 1000, 800), false);
+  assert.equal(selectionEndsAtTail(null, 0, 1000, 800), false);
+  // A single-step series has no span to scale the tolerance by.
+  assert.equal(selectionEndsAtTail(5, 5, 5, 800), true);
+  assert.equal(selectionEndsAtTail(4, 5, 5, 800), false);
+});
+
+test('following the tail keeps the left edge and exposes new points', () => {
+  assert.deepEqual(followTailRange(400, 1000, 1200), { min: 400, max: 1200 });
+  assert.equal(followTailRange(400, 1000, 1000), null);
+  assert.equal(followTailRange(400, 1000, 900), null);
+  assert.equal(followTailRange(null, 1000, 1200), null);
+  assert.equal(followTailRange(1300, 1000, 1200), null);
 });
 
 test('palette colours and trend patterns stay distinct', () => {
