@@ -47,6 +47,7 @@ from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
 from toolkit.util.losses import wavelet_loss, stepped_loss, band_loss
 from toolkit.loss_split import resolve_loss_split
+from toolkit.latent_perceptual import is_supported_arch
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
@@ -119,6 +120,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.normal_loss_model: Optional[DifferentiableNormalEncoder] = None
         self.latent_perceptual_model = None
         self._latent_perceptual_import_failed = False
+        self._latent_perceptual_unsupported_warned = False
+        self._latent_perceptual_shape_warned = False
         self._video_perceptual_decoder = None
         self._dataset_series_key_by_id = {}
         self._dataset_sequence_by_series_key = {}
@@ -963,7 +966,21 @@ class SDTrainer(BaseSDTrainProcess):
     ) -> torch.Tensor:
         if self.train_config.latent_perceptual_loss_weight <= 0:
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
+        if not is_supported_arch(getattr(self.sd, 'arch', '')):
+            if not self._latent_perceptual_unsupported_warned:
+                self._latent_perceptual_unsupported_warned = True
+                print_acc(
+                    f"Latent perceptual loss disabled: arch={getattr(self.sd, 'arch', 'unknown')} "
+                    "uses a latent layout that E-LatentLPIPS does not support."
+                )
+            return torch.zeros((), device=self.device_torch, dtype=torch.float32)
         if len(noise_pred.shape) != 4:
+            if not self._latent_perceptual_shape_warned:
+                self._latent_perceptual_shape_warned = True
+                print_acc(
+                    "Latent perceptual loss disabled: it only supports 4D image latents, "
+                    "but this model predicts video/5D latents."
+                )
             return torch.zeros((), device=self.device_torch, dtype=torch.float32)
 
         if self.latent_perceptual_model is None and not self._latent_perceptual_import_failed:

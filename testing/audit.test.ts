@@ -107,6 +107,92 @@ test('diffusion_loss_weight is reported as unused', () => {
   assert.ok(issues.some(issue => issue.id.includes('diffusion_loss_weight.unused')));
 });
 
+test('latent perceptual on ideogram4 warns that the arch is unsupported', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({ train: { latent_perceptual_loss_weight: 0.1 } }),
+    arch,
+  });
+  assert.ok(issues.some(issue => issue.id === 'train.latent_perceptual.unsupported_arch'));
+});
+
+test('latent perceptual on a supported image arch has no arch warning', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({ train: { latent_perceptual_loss_weight: 0.1 } }),
+    arch: { name: 'flux', group: 'image' },
+  });
+  assert.ok(!issues.some(issue => issue.id.includes('latent_perceptual.unsupported')));
+});
+
+test('latent perceptual on a video arch warns that video is unsupported', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({ train: { latent_perceptual_loss_weight: 0.1 } }),
+    arch: { name: 'wan21', group: 'video', isVideoModel: true },
+  });
+  assert.ok(issues.some(issue => issue.id === 'train.latent_perceptual.unsupported_video'));
+});
+
+test('dataset depth override with a zero global weight is flagged', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({
+      process: { depth_consistency: { loss_weight: 0 } },
+      dataset: { depth_loss_weight: 0.1 },
+    }),
+    arch,
+  });
+  assert.ok(issues.some(issue => issue.id.includes('depth.global_disabled')));
+});
+
+test('dataset depth override is allowed with global preview_only', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({
+      process: { depth_consistency: { loss_weight: 0, preview_only: true } },
+      dataset: { depth_loss_weight: 0.1 },
+    }),
+    arch,
+  });
+  assert.ok(!issues.some(issue => issue.id.includes('depth.global_disabled')));
+});
+
+test('loss split is unused when the depth gate is off', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({
+      process: { depth_consistency: { loss_weight: 0 } },
+      dataset: { depth_loss_weight: 0.1, loss_split: 'diffusion_depth' },
+    }),
+    arch,
+  });
+  assert.ok(issues.some(issue => issue.id.includes('loss_split.unused')));
+});
+
+test('dataset vae anchor override cannot enable the loss by itself', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({
+      process: { face_id: { vae_anchor_loss_weight: 0 } },
+      dataset: { vae_anchor_loss_weight: 0.1 },
+    }),
+    arch,
+  });
+  assert.ok(issues.some(issue => issue.id.includes('vae_anchor.global_disabled')));
+});
+
+test('perceptual_restrict_to_body is reported as unimplemented', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({ dataset: { perceptual_restrict_to_body: true } }),
+    arch,
+  });
+  assert.ok(issues.some(issue => issue.id.includes('perceptual_restrict_to_body.unsupported')));
+});
+
+test('global perceptual_restrict_to_body is reported as unimplemented', () => {
+  const issues = auditJobConfig({
+    config: baseConfig({
+      process: { subject_mask: { enabled: true, perceptual_restrict_to_body: true } },
+    }),
+    arch,
+  });
+  assert.ok(issues.some(issue => issue.id === 'global.subject_mask.perceptual_restrict_to_body.unsupported'));
+});
+
 test('countIssues groups by severity', () => {
   const counts = countIssues([
     { id: 'a', path: '', severity: 'error', section: '', target: '', title: '', message: '' },

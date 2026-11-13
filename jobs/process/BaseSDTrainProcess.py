@@ -1,5 +1,6 @@
 import copy
 import glob
+import importlib.util
 import inspect
 import json
 import random
@@ -62,6 +63,7 @@ from toolkit.timestep_weighing.quantile_weights import (
     sample_timestep_indices,
     timestep_weights_supported,
 )
+from toolkit.latent_perceptual import is_supported_arch
 import gc
 
 from tqdm import tqdm
@@ -201,12 +203,48 @@ class BaseSDTrainProcess(BaseTrainProcess):
         range_ignoring_types = FIXED_STEP_TIMESTEP_TYPES | {'next_sample'}
         face_conf = self.get_conf('face_id', None)
         depth_conf = self.get_conf('depth_consistency', None)
-        any_depth_weight = False
+        subject_mask_conf = self.get_conf('subject_mask', None)
+
+        depth_conf_weight = 0.0
+        depth_conf_preview_only = False
         if depth_conf is not None:
-            any_depth_weight = float(depth_conf.get('loss_weight', 0.1)) > 0
-        for dataset in self.dataset_configs:
-            if (getattr(dataset, 'depth_loss_weight', None) or 0) > 0:
-                any_depth_weight = True
+            depth_conf_weight = float(depth_conf.get('loss_weight', 0.1) or 0)
+            depth_conf_preview_only = bool(depth_conf.get('preview_only', False))
+        any_depth_override = any(
+            (getattr(dataset, 'depth_loss_weight', None) or 0) > 0
+            for dataset in self.dataset_configs
+        )
+        # The depth loss can only run when the global block allows it: either a
+        # positive global weight, or preview_only with a per-dataset override.
+        depth_loss_active = depth_conf is not None and (
+            depth_conf_weight > 0 or (depth_conf_preview_only and any_depth_override)
+        )
+
+        model_arch = str(getattr(self.model_config, 'arch', '') or '')
+        latent_perceptual_weight = float(
+            getattr(self.train_config, 'latent_perceptual_loss_weight', 0) or 0
+        )
+        if latent_perceptual_weight > 0:
+            if not is_supported_arch(model_arch):
+                print_acc(
+                    f"[config] warning: latent_perceptual_loss_weight is set but arch={model_arch} "
+                    "uses a latent layout that E-LatentLPIPS does not support; the loss will be skipped"
+                )
+            else:
+                try:
+                    has_elatentlpips = importlib.util.find_spec("elatentlpips") is not None
+                except Exception:
+                    has_elatentlpips = False
+                if not has_elatentlpips:
+                    print_acc(
+                        "[config] warning: latent_perceptual_loss_weight is set but the optional "
+                        "elatentlpips package is not installed; the loss will be skipped"
+                    )
+        if subject_mask_conf is not None and subject_mask_conf.get('perceptual_restrict_to_body') is True:
+            print_acc(
+                "[config] warning: subject_mask.perceptual_restrict_to_body is not implemented by the "
+                "trainer; it has no effect"
+            )
 
         aux_range_pairs = [
             ('depth_loss_weight', 'depth_loss_min_t', 'depth_loss_max_t'),
@@ -241,11 +279,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"[config] warning: dataset={dataset_name} diffusion_loss_weight is not read by the trainer"
                 )
 
-            if (getattr(dataset, 'depth_loss_weight', None) or 0) > 0 and depth_conf is None:
-                print_acc(
-                    f"[config] warning: dataset={dataset_name} has depth_loss_weight but no global "
-                    "depth_consistency block; the depth loss will be skipped"
-                )
+            dataset_depth_weight = getattr(dataset, 'depth_loss_weight', None) or 0
+            if dataset_depth_weight > 0:
+                if depth_conf is None:
+                    print_acc(
+                        f"[config] warning: dataset={dataset_name} has depth_loss_weight but no global "
+                        "depth_consistency block; the depth loss will be skipped"
+                    )
+                elif not depth_loss_active:
+                    print_acc(
+                        f"[config] warning: dataset={dataset_name} has depth_loss_weight but "
+                        "depth_consistency.loss_weight is 0; the depth loss (and its GT caching) "
+                        "will be skipped. Set the global depth loss weight above zero."
+                    )
             face_weight_values = [
                 getattr(dataset, key, None)
                 for key in [
@@ -269,6 +315,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"[config] warning: dataset={dataset_name} has latent_perceptual_loss_weight but "
                     "train.latent_perceptual_loss_weight is 0; the loss will be skipped"
                 )
+            dataset_anchor_weight = getattr(dataset, 'vae_anchor_loss_weight', None) or 0
+            if dataset_anchor_weight > 0 and face_conf is not None:
+                if float(face_conf.get('vae_anchor_loss_weight', 0.0) or 0) <= 0:
+                    print_acc(
+                        f"[config] warning: dataset={dataset_name} has vae_anchor_loss_weight but "
+                        "face_id.vae_anchor_loss_weight is 0; a dataset override cannot enable the "
+                        "VAE anchor loss, so it will be skipped"
+                    )
+            if getattr(dataset, 'perceptual_restrict_to_body', None) is True:
+                print_acc(
+                    f"[config] warning: dataset={dataset_name} perceptual_restrict_to_body is not "
+                    "implemented by the trainer; it has no effect"
+                )
 
             for weight_key, min_key, max_key in aux_range_pairs:
                 weight = getattr(dataset, weight_key, None) or 0
@@ -281,7 +340,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         f"because {weight_key} is 0"
                     )
 
-            if dataset.loss_split is not None and not any_depth_weight:
+            if dataset.loss_split is not None and not depth_loss_active:
                 print_acc(
                     f"[config] warning: dataset={dataset_name} loss_split is unused because no depth loss is active"
                 )

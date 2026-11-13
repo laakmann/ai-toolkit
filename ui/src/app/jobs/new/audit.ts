@@ -49,6 +49,12 @@ const FIXED_STEP_TYPES = new Set(['one_step', 'two_step', 'four_step', 'eight_st
 /** Types that do not use the normal [min, max] timestep window. */
 const RANGE_IGNORING_TYPES = new Set(['one_step', 'two_step', 'four_step', 'eight_step', 'next_sample']);
 
+/**
+ * Archs whose latent layout the E-LatentLPIPS-based loss cannot interpret.
+ * Keep in sync with toolkit/latent_perceptual.py.
+ */
+const LATENT_PERCEPTUAL_UNSUPPORTED_ARCHS = new Set(['ideogram4']);
+
 interface AuxLossRule {
   key: string;
   label: string;
@@ -414,6 +420,12 @@ export function auditJobConfig({ config, arch }: AuditContext): AuditIssue[] {
     const weight = asNumber(ds.depth_loss_weight);
     if (weight !== null && weight > 0) anyDepthWeight = true;
   });
+  // Mirrors the trainer gate: a positive global weight, or preview_only with a
+  // dataset override, is what actually enables the depth loss.
+  const anyDepthOverride = datasets.some(ds => (asNumber(ds.depth_loss_weight) ?? 0) > 0);
+  const depthLossActive =
+    globalDepthWeight > 0 ||
+    ((process as any)?.depth_consistency?.preview_only === true && anyDepthOverride);
 
   const checkAuxRange = (index: number, label: string, target: string, rule: AuxLossRule) => {
     const min = rule.minKey ? asNumber((datasets[index] as any)[rule.minKey]) : null;
@@ -506,6 +518,35 @@ export function auditJobConfig({ config, arch }: AuditContext): AuditIssue[] {
               title: `${rule.label} has no global setup`,
               message: `Set a ${rule.globalBlock} block in the advanced config or the loss will be skipped.`,
             });
+          } else if (
+            rule.globalBlock === 'depth_consistency' &&
+            (asNumber(globalBlock.loss_weight) ?? 0) <= 0 &&
+            globalBlock.preview_only !== true
+          ) {
+            add({
+              id: `dataset.${index}.${rule.key}.global_disabled`,
+              path: `datasets[${index}].${String(rule.weightKey)}`,
+              severity: 'warning',
+              section: label,
+              target,
+              title: 'Depth loss is gated off',
+              message:
+                'depth_consistency.loss_weight is 0, so per-dataset depth overrides are ignored and depth targets are not cached. Set the global depth loss weight above zero.',
+            });
+          } else if (
+            rule.key === 'vae_anchor' &&
+            (asNumber(globalBlock.vae_anchor_loss_weight) ?? 0) <= 0
+          ) {
+            add({
+              id: `dataset.${index}.${rule.key}.global_disabled`,
+              path: `datasets[${index}].${String(rule.weightKey)}`,
+              severity: 'warning',
+              section: label,
+              target,
+              title: 'VAE anchor loss is gated off',
+              message:
+                'face_id.vae_anchor_loss_weight is 0. Unlike the identity/body losses, a per-dataset override cannot enable the VAE anchor loss.',
+            });
           }
         }
       }
@@ -550,19 +591,20 @@ export function auditJobConfig({ config, arch }: AuditContext): AuditIssue[] {
       }
     }
 
-    if (dataset.perceptual_restrict_to_body === true && !(process as any)?.subject_mask?.enabled) {
+    if (dataset.perceptual_restrict_to_body === true) {
       add({
-        id: `dataset.${index}.perceptual_restrict_to_body.no_mask`,
+        id: `dataset.${index}.perceptual_restrict_to_body.unsupported`,
         path: `datasets[${index}].perceptual_restrict_to_body`,
         severity: 'warning',
         section: label,
         target,
-        title: 'Subject masks are disabled',
-        message: 'perceptual_restrict_to_body has no effect unless subject_mask.enabled is true.',
+        title: 'Perceptual body restriction is not implemented',
+        message:
+          'The trainer accepts perceptual_restrict_to_body but no loss reads it, so enabling it has no effect.',
       });
     }
 
-    if (hasValue(dataset, 'loss_split') && !anyDepthWeight) {
+    if (hasValue(dataset, 'loss_split') && !depthLossActive) {
       add({
         id: `dataset.${index}.loss_split.unused`,
         path: `datasets[${index}].loss_split`,
@@ -651,7 +693,50 @@ export function auditJobConfig({ config, arch }: AuditContext): AuditIssue[] {
     'Latent perceptual',
   );
 
-  if (hasValue(train, 'loss_split') && !anyDepthWeight) {
+  const latentPerceptualRequested =
+    (asNumber(train?.latent_perceptual_loss_weight) ?? 0) > 0 ||
+    datasets.some(dataset => (asNumber((dataset as any).latent_perceptual_loss_weight) ?? 0) > 0);
+  if (latentPerceptualRequested) {
+    const archName = String(arch?.name || '').split(':')[0];
+    if (LATENT_PERCEPTUAL_UNSUPPORTED_ARCHS.has(archName)) {
+      add({
+        id: 'train.latent_perceptual.unsupported_arch',
+        path: 'train.latent_perceptual_loss_weight',
+        severity: 'warning',
+        section: 'Auxiliary Losses',
+        target: 'aux',
+        title: 'Latent perceptual is not supported for this model',
+        message:
+          `${archName} uses 128-channel latents with a different packing order than the Flux/Flux2 ` +
+          'metrics, so the trainer will skip this loss. Use a pixel-space loss (depth/identity) instead.',
+      });
+    } else if (arch?.isVideoModel || arch?.group === 'video') {
+      add({
+        id: 'train.latent_perceptual.unsupported_video',
+        path: 'train.latent_perceptual_loss_weight',
+        severity: 'warning',
+        section: 'Auxiliary Losses',
+        target: 'aux',
+        title: 'Latent perceptual does not support video',
+        message: 'Latent perceptual only handles 4D image latents, so it will be skipped for video models.',
+      });
+    }
+  }
+
+  if ((process as any)?.subject_mask?.perceptual_restrict_to_body === true) {
+    add({
+      id: 'global.subject_mask.perceptual_restrict_to_body.unsupported',
+      path: 'subject_mask.perceptual_restrict_to_body',
+      severity: 'warning',
+      section: 'Auxiliary Losses',
+      target: 'aux',
+      title: 'Perceptual body restriction is not implemented',
+      message:
+        'The trainer accepts subject_mask.perceptual_restrict_to_body but no loss reads it, so enabling it has no effect.',
+    });
+  }
+
+  if (hasValue(train, 'loss_split') && !depthLossActive) {
     add({
       id: 'train.loss_split.unused',
       path: 'train.loss_split',
