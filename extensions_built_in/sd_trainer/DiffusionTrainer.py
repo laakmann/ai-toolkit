@@ -138,14 +138,48 @@ class DiffusionTrainer(SDTrainer):
                     raise
         raise last_error
 
+    # Optional Job flag columns and the SQLite type each one needs. These are
+    # only used to repair a database volume that predates the current schema
+    # (normally `npm run update_db` does this through Prisma).
+    _OPTIONAL_JOB_COLUMNS = {
+        "return_to_queue": "BOOLEAN NOT NULL DEFAULT 0",
+        "save_now": "BOOLEAN NOT NULL DEFAULT 0",
+        "sample_now": "BOOLEAN NOT NULL DEFAULT 0",
+    }
+
+    def _add_missing_job_column(self, column: str) -> bool:
+        """Add one missing optional Job flag column to the database.
+
+        A bind-mounted `aitk_db.db` can be older than the code and the image,
+        and Prisma's migration only touches the DB it is pointed at. Rather
+        than abort a long training run, add the flag with the same shape
+        Prisma uses. The durable fix is still `npm run update_db`.
+        """
+        ddl = self._OPTIONAL_JOB_COLUMNS.get(column)
+        if ddl is None:
+            return False
+        try:
+            with self._db_connect() as conn:
+                conn.execute(f"ALTER TABLE Job ADD COLUMN {column} {ddl}")
+        except sqlite3.OperationalError as e:
+            print(
+                f"[AITK] Warning: could not add Job.{column} to "
+                f"{os.path.abspath(self.sqlite_db_path)}: {e}"
+            )
+            return False
+        print(
+            f"[AITK] Added missing Job.{column} column to "
+            f"{os.path.abspath(self.sqlite_db_path)}."
+        )
+        return True
+
     def _read_job_flag(self, column: str) -> bool:
         """Read a boolean flag from the Job row for this job.
 
         Flags are looked up by column name from our own code, never user input.
         If the database predates a column (for example, a DB created before
-        `sample_now` was added), the flag is treated as unset and the run keeps
-        going instead of dying. ``npm run update_db`` in ``ui/`` adds the
-        missing columns.
+        `sample_now` was added), the column is added and the run keeps going
+        instead of dying. ``npm run update_db`` in ``ui/`` is the durable fix.
         """
         if not self.is_ui_trainer or column in self._missing_db_columns:
             return False
@@ -163,10 +197,12 @@ class DiffusionTrainer(SDTrainer):
         except sqlite3.OperationalError as e:
             if "no such column" not in str(e):
                 raise
+            if self._add_missing_job_column(column):
+                return self._retry_db_operation(_check_flag)
             self._missing_db_columns.add(column)
             print(
                 f"[AITK] Warning: Job.{column} is missing from "
-                f"{self.sqlite_db_path}; ignoring it for this run."
+                f"{os.path.abspath(self.sqlite_db_path)}; ignoring it for this run."
             )
             print(
                 "[AITK]          Run `npm run update_db` in ui/ "
