@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Home, Settings, BrainCircuit, Images, Plus, X, Sparkles } from 'lucide-react';
@@ -13,30 +13,10 @@ import OstrisCloudBalance from './OstrisCloudBalance';
 
 export const mobileSidebarState = createGlobalState<boolean>(false);
 
-const Sidebar = () => {
+const Sidebar = ({ appVersion }: { appVersion?: string }) => {
   const [isMobileOpen, setIsMobileOpen] = mobileSidebarState.use();
   const pathname = usePathname();
-  const [version, setVersion] = useState(process.env.NEXT_PUBLIC_APP_VERSION || 'unknown');
-
-  // Read the version from the running checkout at runtime. NEXT_PUBLIC_APP_VERSION
-  // is baked at build time, so a dev server or stale build can keep showing the
-  // old number even after version.py changes.
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/version', { cache: 'no-store' })
-      .then(res => (res.ok ? res.json() : null))
-      .then(data => {
-        if (!cancelled && data?.version) {
-          setVersion(String(data.version));
-        }
-      })
-      .catch(() => {
-        // keep the build-time fallback
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const version = appVersion || process.env.NEXT_PUBLIC_APP_VERSION || 'unknown';
 
   // Close mobile menu on route change
   useEffect(() => {
@@ -143,9 +123,7 @@ const Sidebar = () => {
           <ThemeToggle />
         </div>
       </div>
-      <div className="text-center text-[10px] text-gray-400 py-1 bg-gray-800">
-        Ostris AI-Toolkit v{version}
-      </div>
+      <div className="text-center text-[10px] text-gray-400 py-1 bg-gray-800">Ostris AI-Toolkit v{version}</div>
     </>
   );
 

@@ -4,7 +4,7 @@ import type { NextRequest } from 'next/server';
 
 // if route starts with these, approve
 // album art is fetched by plain <img> tags, which cannot send the bearer token
-const publicRoutes = ['/api/img/', '/api/files/', '/api/audio/art/'];
+const publicRoutes = ['/api/img/', '/api/files/', '/api/audio/art/', '/api/version'];
 
 export function middleware(request: NextRequest) {
   // check env var for AI_TOOLKIT_AUTH, if not set, approve all requests

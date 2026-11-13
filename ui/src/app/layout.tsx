@@ -13,6 +13,7 @@ import MergeLoRAsModal from '@/components/MergeLoRAsModal';
 import SafetensorsInfoModal from '@/components/SafetensorsInfoModal';
 import UpsamplePromptsModal from '@/components/UpsamplePromptsModal';
 import PromptBoxEditorModal from '@/components/PromptBoxEditorModal';
+import { getAppVersion } from '@/server/appVersion';
 
 export const dynamic = 'force-dynamic';
 
@@ -34,6 +35,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   const authRequired = process.env.AI_TOOLKIT_AUTH ? true : false;
 
   const platform = os.platform();
+  const appVersion = getAppVersion();
 
   return (
     <html lang="en" suppressHydrationWarning>
@@ -55,7 +57,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <ThemeProvider>
           <AuthWrapper authRequired={authRequired}>
             <div className="flex h-screen bg-gray-950">
-              <Sidebar />
+              <Sidebar appVersion={appVersion} />
               <main className="flex-1 overflow-auto bg-gray-950 text-gray-100 relative">
                 <Suspense>{children}</Suspense>
               </main>
