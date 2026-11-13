@@ -6,7 +6,7 @@ import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
 import { getTotalSteps } from '@/utils/jobs';
 import { Cpu, HardDrive, Info, Gauge, Download, Maximize2, Minimize2, Search, ArrowDownToLine, WrapText } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import useJobLog from '@/hooks/useJobLog';
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import classNames from 'classnames';
@@ -53,6 +53,34 @@ export default function JobOverview({ job }: JobOverviewProps) {
     virtuosoRef.current?.scrollToIndex({ index: filteredLogLines.length - 1, behavior: 'smooth' });
   };
 
+  // Start every job pinned to the newest line.
+  useEffect(() => {
+    setFollowLog(true);
+  }, [job.id]);
+
+  // Filter changes replace the rendered list. If we were following, snap to the
+  // newest matching line instead of leaving the viewport at the old index.
+  const lastSearchRef = useRef(logSearch);
+  useEffect(() => {
+    if (lastSearchRef.current === logSearch) return;
+    lastSearchRef.current = logSearch;
+    if (!followLog || filteredLogLines.length === 0) return;
+    virtuosoRef.current?.scrollToIndex({ index: filteredLogLines.length - 1, behavior: 'auto' });
+  }, [logSearch, followLog, filteredLogLines.length]);
+
+  // Loading the full log replaces the bounded tail with the whole file. Snap
+  // back to the newest line once that replacement has rendered.
+  const wasLoadingFullLogRef = useRef(false);
+  useEffect(() => {
+    if (wasLoadingFullLogRef.current && !loadingFullLog && followLog) {
+      const index = filteredLogLines.length - 1;
+      if (index >= 0) {
+        virtuosoRef.current?.scrollToIndex({ index, behavior: 'auto' });
+      }
+    }
+    wasLoadingFullLogRef.current = loadingFullLog;
+  }, [loadingFullLog, followLog, filteredLogLines.length]);
+
   const handleLoadFullLog = async () => {
     if (loadingFullLog) return;
     setLoadingFullLog(true);
@@ -89,17 +117,17 @@ export default function JobOverview({ job }: JobOverviewProps) {
   }
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:gap-6 md:grid-cols-3">
+    <div className="grid grid-cols-1 gap-4 md:gap-6 md:grid-cols-3 md:h-full md:min-h-0 md:pb-4">
       {/* Job Information Panel */}
-      <div className="md:col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
-        <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
+      <div className="md:col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col md:h-full md:min-h-0">
+        <div className="bg-gray-800 px-4 py-3 flex items-center justify-between shrink-0">
           <h2 className="text-gray-100">
             <Info className="w-5 h-5 mr-2 -mt-1 text-amber-600 dark:text-amber-400 inline-block" /> {job.info}
           </h2>
           <span className={`px-3 py-1 rounded-full text-sm ${getStatusColor(job.status)}`}>{job.status}</span>
         </div>
 
-        <div className="p-4 space-y-6 flex flex-col flex-grow">
+        <div className="p-4 space-y-6 flex flex-col flex-grow min-h-0">
           {/* Progress Bar */}
           {totalSteps > 0 && (
             <div className="space-y-2">
@@ -146,10 +174,12 @@ export default function JobOverview({ job }: JobOverviewProps) {
           <div
             className={classNames(
               'bg-gray-950 rounded-lg flex flex-col',
-              logMaximized ? 'fixed inset-0 z-40 p-3 sm:p-5' : 'relative flex-grow min-h-[420px] h-[65vh] p-2',
+              logMaximized
+                ? 'fixed inset-0 z-40 p-3 sm:p-5'
+                : 'relative flex-grow min-h-[420px] h-[65vh] p-2 md:h-auto md:min-h-[200px] md:flex-1',
             )}
           >
-            <div className="flex flex-wrap items-center gap-1.5 pb-2">
+            <div className="flex flex-wrap items-center gap-1.5 pb-2 shrink-0">
               <div className="relative min-w-[140px] flex-1">
                 <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-500" />
                 <input
@@ -232,8 +262,11 @@ export default function JobOverview({ job }: JobOverviewProps) {
                   ref={virtuosoRef}
                   style={{ height: '100%' }}
                   data={filteredLogLines}
-                  followOutput={followLog ? 'smooth' : false}
+                  alignToBottom
+                  initialTopMostItemIndex={filteredLogLines.length - 1}
+                  followOutput={followLog ? 'auto' : false}
                   atBottomStateChange={atBottom => setFollowLog(atBottom)}
+                  atBottomThreshold={80}
                   increaseViewportBy={500}
                   itemContent={(index, line) => (
                     <pre
@@ -253,11 +286,13 @@ export default function JobOverview({ job }: JobOverviewProps) {
       </div>
 
       {/* GPU Widget Panel */}
-      <div className="md:col-span-1">
-        <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
-        <div className="mt-4">{isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}</div>
+      <div className="md:col-span-1 md:flex md:flex-col md:h-full md:min-h-0">
+        <div className="shrink-0">{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
+        <div className="mt-4 shrink-0">
+          {isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}
+        </div>
         {jobType === 'train' && (
-          <div className="mt-4">
+          <div className="mt-4 md:flex-1 md:min-h-0">
             <FilesWidget jobID={job.id} jobName={job.name} />
           </div>
         )}
