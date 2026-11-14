@@ -42,6 +42,20 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'config.process[0].network.pretrained_lora_path': {
+    title: 'Pretrained LoRA',
+    description: (
+      <>
+        Optional: path to a LoRA or LoKr checkpoint to use as the starting weights for this training run. The file is
+        loaded before training begins, so the job can refine an existing adapter instead of starting from scratch.
+        <br />
+        <br />
+        Use the fork button on a checkpoint in a completed or running job to open a copy of that job with this field
+        already filled in. The path must point to an existing checkpoint file, usually a <code>.safetensors</code> file
+        inside a job folder or the models folder.
+      </>
+    ),
+  },
   'config.process[0].model.name_or_path': {
     title: 'Name or Path',
     description: (
@@ -134,6 +148,35 @@ const docs: { [key: string]: ConfigDoc } = {
         When loading audio to match the number of frames requested, this option will preserve the pitch of the audio if
         the length does not match training target. It is recommended to have a dataset that matches your target length,
         as this option can add sound distortions.
+      </>
+    ),
+  },
+  'datasets.augmentations': {
+    title: 'Dataset Augmentations',
+    description: (
+      <>
+        Optional albumentations transforms applied on the fly to this dataset's images. Each entry has a{' '}
+        <code>method</code> and an optional <code>params</code> mapping. The method name must exist in the installed
+        albumentations version.
+        <br />
+        <br />
+        <pre className="overflow-x-auto rounded bg-gray-950 p-2 text-xs text-gray-300">{`augmentations:
+  - method: RandomBrightnessContrast
+    params:
+      brightness_limit: 0.12
+      contrast_limit: 0.1
+      p: 0.7
+  - method: GaussianBlur
+    params:
+      blur_limit: [3, 3]
+      p: 0.2`}</pre>
+        Augmentations are applied per sample, so the same image can look different on every step. Latent caching is
+        disabled for a dataset while augmentations are enabled, because the augmented pixels cannot be reused from the
+        cache. Spatial transforms can also be replayed onto control images when that option is enabled.
+        <br />
+        <br />
+        Use the visual rows to edit common values, or the raw editor to paste an existing YAML/JSON list. Presets are
+        starting points and can be combined with additional transforms.
       </>
     ),
   },

@@ -29,6 +29,7 @@ import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
 import DatasetTrainingSection from '@/components/DatasetTrainingSection';
+import PretrainedLoraInput from '@/components/PretrainedLoraInput';
 import AuxiliaryLossSettings from '@/components/AuxiliaryLossSettings';
 import type { AuditIssue } from './audit';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
@@ -266,6 +267,10 @@ export default function SimpleJob({
               placeholder="Enter training name"
               disabled={runId !== null}
               required
+            />
+            <PretrainedLoraInput
+              value={jobConfig.config.process[0].network?.pretrained_lora_path ?? ''}
+              onChange={value => setJobConfig(value, 'config.process[0].network.pretrained_lora_path')}
             />
             {showGPUSelect && (
               <SelectInput
@@ -1538,6 +1543,7 @@ export default function SimpleJob({
                     setJobConfig={setJobConfig}
                     issues={issues}
                     disabled={isLoading}
+                    showAugmentations={!isAudioModel && !isLlmModel}
                   />
                 </div>
               ))}

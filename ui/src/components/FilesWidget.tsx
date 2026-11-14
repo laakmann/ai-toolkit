@@ -1,6 +1,7 @@
 import React from 'react';
+import Link from 'next/link';
 import useFilesList from '@/hooks/useFilesList';
-import { Loader2, AlertCircle, Download, Box, Brain, Trash2, SlidersHorizontal, Info } from 'lucide-react';
+import { Loader2, AlertCircle, Download, Box, Brain, Trash2, SlidersHorizontal, Info, GitFork } from 'lucide-react';
 import { openMergeLoRAsModal } from './MergeLoRAsModal';
 import { openSafetensorsInfoModal } from './SafetensorsInfoModal';
 import { getFilename, getFoldername, encodeFilePathForUrl } from '@/utils/basic';
@@ -93,6 +94,10 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
             {checkpointFiles.map((file, index) => {
               const fileName = getFilename(file.path);
               const nameWithoutExt = fileName.replace('.safetensors', '');
+              const forkHref = `/jobs/new?${new URLSearchParams({
+                cloneId: jobID,
+                pretrainedLoraPath: file.path,
+              }).toString()}`;
               return (
                 <div
                   key={index}
@@ -125,6 +130,13 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
                         <Info className="w-3 h-3 text-sky-400" />
                       </button>
                     )}
+                    <Link
+                      href={forkHref}
+                      className="bg-emerald-500 bg-opacity-0 group-hover:bg-opacity-10 hover:!bg-opacity-30 rounded-full p-1 transition-all"
+                      title="Fork training from this checkpoint"
+                    >
+                      <GitFork className="w-3 h-3 text-emerald-400" />
+                    </Link>
                     <a
                       target="_blank"
                       href={`/api/files/${encodeFilePathForUrl(file.path)}`}

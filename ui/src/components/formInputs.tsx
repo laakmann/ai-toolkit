@@ -26,6 +26,7 @@ export interface InputProps {
 export interface TextInputProps extends InputProps {
   value: string;
   onChange: (value: string) => void;
+  onBlur?: () => void;
   type?: 'text' | 'password';
   disabled?: boolean;
   suffix?: React.ReactNode;
@@ -36,6 +37,7 @@ export const TextInput = forwardRef<HTMLInputElement, TextInputProps>((props: Te
     label,
     value,
     onChange,
+    onBlur,
     placeholder,
     required,
     disabled,
@@ -74,6 +76,7 @@ export const TextInput = forwardRef<HTMLInputElement, TextInputProps>((props: Te
             onChange={e => {
               if (!disabled) onChange(e.target.value);
             }}
+            onBlur={onBlur}
             className="flex-1 min-w-0 bg-transparent text-sm px-3 py-1 text-gray-100 placeholder:text-gray-500 focus:outline-none"
             placeholder={placeholder}
             required={required}
@@ -91,6 +94,7 @@ export const TextInput = forwardRef<HTMLInputElement, TextInputProps>((props: Te
           onChange={e => {
             if (!disabled) onChange(e.target.value);
           }}
+          onBlur={onBlur}
           className={`${inputClasses} ${disabled ? 'opacity-30 cursor-not-allowed' : ''}`}
           placeholder={placeholder}
           required={required}

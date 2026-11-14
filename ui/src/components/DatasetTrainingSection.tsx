@@ -5,6 +5,7 @@ import { ChevronDown } from 'lucide-react';
 import classNames from 'classnames';
 import { Checkbox, FormGroup, NumberInput, SelectInput } from '@/components/formInputs';
 import TimestepWeightsInput from '@/components/TimestepWeightsInput';
+import DatasetAugmentationsSection from '@/components/DatasetAugmentationsSection';
 import { InlineIssues } from '@/components/ConfigAuditPanel';
 import type { AuditIssue } from '@/app/jobs/new/audit';
 import type { DatasetConfig, ProcessConfig, TrainConfig } from '@/types';
@@ -231,6 +232,7 @@ export default function DatasetTrainingSection({
   setJobConfig,
   issues,
   disabled,
+  showAugmentations = true,
 }: {
   dataset: DatasetConfig;
   index: number;
@@ -239,6 +241,7 @@ export default function DatasetTrainingSection({
   setJobConfig: (value: any, key: string) => void;
   issues: AuditIssue[];
   disabled?: boolean;
+  showAugmentations?: boolean;
 }) {
   const setDataset = (key: keyof DatasetConfig, value: unknown) => {
     setJobConfig(value, `config.process[0].datasets[${index}].${String(key)}`);
@@ -442,6 +445,19 @@ export default function DatasetTrainingSection({
 
         <InlineIssues issues={auxIssues} className="mt-2" />
       </div>
+
+      {showAugmentations && (
+        <div className="mt-3" data-audit-target={`dataset-${index}-augmentations`}>
+          <DatasetAugmentationsSection
+            value={dataset.augmentations}
+            onChange={value => setDataset('augmentations', value)}
+            shuffle={dataset.shuffle_augmentations}
+            onShuffleChange={value => setDataset('shuffle_augmentations', value ? true : undefined)}
+            cachingEnabled={Boolean(dataset.cache_latents || dataset.cache_latents_to_disk)}
+            disabled={disabled}
+          />
+        </div>
+      )}
     </div>
   );
 }

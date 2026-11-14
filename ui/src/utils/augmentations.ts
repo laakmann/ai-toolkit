@@ -1,5 +1,8 @@
-// Pure helpers for per-dataset albumentations config. Kept dependency-free so
-// the New Job UI and the node test runner can import it directly.
+// Helpers for per-dataset albumentations config. The only runtime dependency is
+// `yaml`, which lets the raw editor accept either YAML or JSON. The New Job UI
+// and the node test runner both import this module directly.
+
+import YAML from 'yaml';
 
 export interface AugmentationEntry {
   method: string;
@@ -99,7 +102,10 @@ export const AUGMENTATION_PRESETS: AugmentationPreset[] = [
     description: 'Tone and colour variation only. Does not remove texture.',
     entries: [
       { method: 'RandomBrightnessContrast', params: { brightness_limit: 0.15, contrast_limit: 0.15, p: 0.5 } },
-      { method: 'HueSaturationValue', params: { hue_shift_limit: 5, sat_shift_limit: 10, val_shift_limit: 10, p: 0.5 } },
+      {
+        method: 'HueSaturationValue',
+        params: { hue_shift_limit: 5, sat_shift_limit: 10, val_shift_limit: 10, p: 0.5 },
+      },
       { method: 'ImageCompression', params: { quality_range: [60, 95], p: 0.3 } },
       { method: 'GaussNoise', params: { var_limit: [5, 15], p: 0.2 } },
     ],
@@ -120,8 +126,7 @@ export const AUGMENTATION_PRESETS: AugmentationPreset[] = [
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const isFiniteNumber = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isFinite(value);
+const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 
 /**
  * Validate a raw `datasets[].augmentations` value.
@@ -180,27 +185,62 @@ export function validateAugmentations(value: unknown): AugmentationValidation {
   return { entries, errors, warnings };
 }
 
-/** Parse the JSON textarea form of the augmentation list. */
+/** Parse JSON first so JSON syntax errors stay readable, then fall back to YAML. */
+function parseJsonOrYaml(text: string): { value?: unknown; error?: string } {
+  try {
+    return { value: JSON.parse(text) };
+  } catch {
+    try {
+      return { value: YAML.parse(text) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'invalid YAML/JSON';
+      return { error: message };
+    }
+  }
+}
+
+/** Parse the raw textarea form of the augmentation list. Accepts YAML or JSON. */
 export function parseAugmentationsText(text: string): { entries: AugmentationEntry[]; error?: string } {
   const trimmed = text.trim();
   if (trimmed === '') {
     return { entries: [] };
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'invalid JSON';
-    return { entries: [], error: `Invalid JSON: ${message}` };
+  const parsed = parseJsonOrYaml(trimmed);
+  if (parsed.error !== undefined) {
+    return { entries: [], error: `Invalid YAML or JSON: ${parsed.error}` };
   }
 
-  const validation = validateAugmentations(parsed);
+  // Accept the exact snippet from a config file as well as a bare list.
+  let raw = parsed.value;
+  if (isPlainObject(raw) && 'augmentations' in raw) {
+    raw = raw.augmentations;
+  }
+
+  const validation = validateAugmentations(raw);
   if (validation.errors.length > 0) {
     return { entries: [], error: validation.errors[0] };
   }
 
   return { entries: validation.entries };
+}
+
+/** Parse the per-transform params textarea. Accepts a YAML or JSON mapping. */
+export function parseAugmentationParamsText(text: string): { params?: Record<string, unknown>; error?: string } {
+  const trimmed = text.trim();
+  if (trimmed === '') {
+    return { params: {} };
+  }
+
+  const parsed = parseJsonOrYaml(trimmed);
+  if (parsed.error !== undefined) {
+    return { error: `Invalid YAML or JSON: ${parsed.error}` };
+  }
+  if (!isPlainObject(parsed.value)) {
+    return { error: 'Parameters must be a YAML/JSON mapping (object).' };
+  }
+
+  return { params: parsed.value };
 }
 
 export function formatAugmentations(entries: AugmentationEntry[] | null | undefined): string {
@@ -209,6 +249,33 @@ export function formatAugmentations(entries: AugmentationEntry[] | null | undefi
 
 export function formatAugmentationParams(params: Record<string, unknown> | null | undefined): string {
   return JSON.stringify(params ?? {});
+}
+
+/**
+ * Split the shared probability `p` from the method-specific parameters so the
+ * editor can show p as a normal control and keep the params textarea focused.
+ */
+export function splitAugmentationParams(params: Record<string, unknown> | null | undefined): {
+  p: number | null;
+  rest: Record<string, unknown>;
+} {
+  const rest = isPlainObject(params) ? { ...params } : {};
+  const rawP = rest.p;
+  delete rest.p;
+  return { p: isFiniteNumber(rawP) ? rawP : null, rest };
+}
+
+/** Rebuild a params object with p placed last, matching the YAML examples. */
+export function mergeAugmentationParams(
+  rest: Record<string, unknown> | null | undefined,
+  p: number | null | undefined,
+): Record<string, unknown> {
+  const params = isPlainObject(rest) ? { ...rest } : {};
+  delete params.p;
+  if (p !== null && p !== undefined) {
+    params.p = p;
+  }
+  return params;
 }
 
 /** Deep copy so preset edits never mutate the module-level preset objects. */

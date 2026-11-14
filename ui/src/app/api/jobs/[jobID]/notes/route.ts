@@ -1,35 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import prisma from '@/server/prisma';
 import path from 'path';
 import fs from 'fs';
-import { getTrainingFolder } from '@/server/settings';
-
-const getNotesPath = async (jobID: string): Promise<string | null> => {
-  const job = await prisma.job.findUnique({
-    where: { id: jobID },
-  });
-
-  if (!job) {
-    return null;
-  }
-
-  const trainingFolder = await getTrainingFolder();
-  return path.join(trainingFolder, job.name, 'notes.md');
-};
+import { invalidateCache } from '@/server/apiCache';
+import { getJobNotesPath, readJobNotes } from '@/server/jobNotes';
 
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
-  const notesPath = await getNotesPath(jobID);
+  const content = await readJobNotes(jobID);
 
-  if (!notesPath) {
+  if (content === null) {
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
-  }
-
-  let content = '';
-  try {
-    content = await fs.promises.readFile(notesPath, 'utf-8');
-  } catch {
-    // no notes yet, start empty
   }
 
   return NextResponse.json({ content });
@@ -37,7 +17,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
 
 export async function POST(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
-  const notesPath = await getNotesPath(jobID);
+  const notesPath = await getJobNotesPath(jobID);
 
   if (!notesPath) {
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
@@ -50,6 +30,8 @@ export async function POST(request: NextRequest, { params }: { params: { jobID: 
     // the job folder may not exist yet if the job has never run
     await fs.promises.mkdir(path.dirname(notesPath), { recursive: true });
     await fs.promises.writeFile(notesPath, content, 'utf-8');
+    // Keep queue summaries from serving the previous text after an edit.
+    invalidateCache('job-notes-summaries');
   } catch (error) {
     console.error('Error saving notes file:', error);
     return NextResponse.json({ error: 'Error saving notes file' }, { status: 500 });

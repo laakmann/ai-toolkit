@@ -32,6 +32,7 @@ export default function TrainingForm() {
   const searchParams = useSearchParams();
   const runId = searchParams.get('id');
   const cloneId = searchParams.get('cloneId');
+  const pretrainedLoraPath = searchParams.get('pretrainedLoraPath');
   const [gpuIDs, setGpuIDs] = useState<string | null>(null);
   const { settings, isSettingsLoaded } = useSettings();
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
@@ -125,7 +126,7 @@ export default function TrainingForm() {
     return out;
   }, [datasetStats, settings, isSettingsLoaded]);
 
-  // clone existing job
+  // clone or fork an existing job
   useEffect(() => {
     if (cloneId) {
       apiClient
@@ -135,12 +136,20 @@ export default function TrainingForm() {
           console.log('Clone Training:', data);
           setGpuIDs(data.gpu_ids);
           const newJobConfig = migrateJobConfig(JSON.parse(data.job_config));
-          newJobConfig.config.name = `${newJobConfig.config.name}_copy`;
+          const isFork = !!pretrainedLoraPath;
+          newJobConfig.config.name = `${newJobConfig.config.name}${isFork ? '_fork' : '_copy'}`;
+          if (isFork) {
+            const processConfig = newJobConfig.config.process[0];
+            newJobConfig.config.process[0].network = {
+              ...(processConfig.network ?? objectCopy(defaultJobConfig.config.process[0].network!)),
+              pretrained_lora_path: pretrainedLoraPath,
+            };
+          }
           setJobConfig(newJobConfig);
         })
         .catch(error => console.error('Error fetching training:', error));
     }
-  }, [cloneId]);
+  }, [cloneId, pretrainedLoraPath]);
 
   useEffect(() => {
     if (runId) {

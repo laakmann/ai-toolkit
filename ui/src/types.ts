@@ -97,6 +97,7 @@ export interface NetworkConfig {
     ignore_if_contains: string[];
   };
   transformer_only?: boolean;
+  pretrained_lora_path?: string | null;
 }
 
 export interface SaveConfig {
@@ -134,7 +135,8 @@ export interface DatasetConfig {
   num_repeats?: number;
   buckets?: boolean;
   cache_latents?: boolean;
-  augmentations?: { [key: string]: any }[] | null;
+  augmentations?: { method: string; params?: Record<string, unknown> }[] | null;
+  shuffle_augmentations?: boolean;
   timestep_type?: string | null;
   min_denoising_steps?: number | null;
   max_denoising_steps?: number | null;
@@ -431,3 +433,9 @@ export interface GroupedSelectOption {
 }
 
 export type JobStatus = 'queued' | 'running' | 'stopping' | 'stopped' | 'completed' | 'error';
+
+export interface JobNotesSummary {
+  summary: string;
+  excerpt: string;
+  hasNotes: boolean;
+}

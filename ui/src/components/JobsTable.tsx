@@ -13,6 +13,10 @@ import useGPUInfo from '@/hooks/useGPUInfo';
 import { openConfirm } from '@/components/ConfirmModal';
 import { deleteJob, getTotalSteps, stopJob } from '@/utils/jobs';
 import { Trash2 } from 'lucide-react';
+import HoverPreview from '@/components/HoverPreview';
+import JobNotesModal from '@/components/JobNotesModal';
+import TextPreviewModal from '@/components/TextPreviewModal';
+import useJobNotesSummaries from '@/hooks/useJobNotesSummaries';
 
 interface JobsTableProps {
   autoStartQueue?: boolean;
@@ -26,6 +30,10 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
+  const [notesJob, setNotesJob] = useState<Job | null>(null);
+  const [infoJob, setInfoJob] = useState<Job | null>(null);
+  const jobIDs = useMemo(() => jobs.map(job => job.id), [jobs]);
+  const { summaries: notesSummaries } = useJobNotesSummaries(jobIDs);
 
   const refresh = () => {
     refreshJobs();
@@ -124,6 +132,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     {
       title: 'Name',
       key: 'name',
+      className: 'min-w-[10rem] max-w-[20rem]',
       render: row => {
         let title = row.name;
         let href = `/jobs/${row.id}`;
@@ -159,6 +168,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     {
       title: 'Steps',
       key: 'steps',
+      className: 'w-[8rem]',
       render: row => {
         const totalSteps = getTotalSteps(row);
         if (!totalSteps) {
@@ -183,10 +193,12 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     {
       title: 'GPU',
       key: 'gpu_ids',
+      className: 'w-[5.5rem]',
     },
     {
       title: 'Status',
       key: 'status',
+      className: 'w-[6.5rem]',
       render: row => {
         let statusClass = 'text-gray-400';
         if (row.status === 'completed') statusClass = 'text-green-400';
@@ -199,12 +211,46 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     {
       title: 'Info',
       key: 'info',
-      className: 'truncate max-w-xs',
+      className: 'w-[11rem] max-w-[11rem] overflow-hidden',
+      render: row => {
+        const info = typeof row.info === 'string' ? row.info : '';
+        return (
+          <HoverPreview
+            text={info.replace(/\s+/g, ' ').trim()}
+            preview={info}
+            previewClassName="font-mono"
+            onClick={() => setInfoJob(row)}
+            openLabel="Click the Info cell to read the full message"
+            ariaLabel={`View info for ${row.name}`}
+          />
+        );
+      },
+    },
+    {
+      title: 'Notes',
+      key: 'notes',
+      className: 'w-[14rem] max-w-[14rem] overflow-hidden',
+      render: row => {
+        const notes = notesSummaries[row.id];
+        if (!notes?.hasNotes) {
+          return <span className="text-gray-600">&mdash;</span>;
+        }
+
+        return (
+          <HoverPreview
+            text={notes.summary || 'Notes'}
+            preview={notes.excerpt}
+            onClick={() => setNotesJob(row)}
+            openLabel="Click the Notes cell to read the full note"
+            ariaLabel={`View notes for ${row.name}`}
+          />
+        );
+      },
     },
     {
       title: 'Actions',
       key: 'actions',
-      className: 'text-right',
+      className: 'text-right whitespace-nowrap',
       render: row => {
         return <JobActionBar job={row} onRefresh={refreshJobs} autoStartQueue={false} />;
       },
@@ -358,6 +404,12 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
           <UniversalTable columns={columns} rows={jobsDict['Idle'].jobs} isLoading={isLoading} onRefresh={refresh} />
         </div>
       )}
+      <JobNotesModal job={notesJob} onClose={() => setNotesJob(null)} />
+      <TextPreviewModal
+        title={infoJob ? `Info \u2014 ${infoJob.name}` : 'Info'}
+        text={infoJob ? infoJob.info : null}
+        onClose={() => setInfoJob(null)}
+      />
     </div>
   );
 }
