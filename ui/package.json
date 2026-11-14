@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "concurrently -k -n WORKER,UI \"ts-node-dev --project tsconfig.worker.json --respawn --watch cron --transpile-only cron/worker.ts\" \"ts-node-dev --project tsconfig.worker.json --respawn --watch cron --transpile-only cron/fileServer.ts dev --port 3000\"",
+    "prebuild": "node scripts/ensure-ui-deps.cjs",
     "build": "tsc -p tsconfig.worker.json && next build",
     "start": "concurrently --restart-tries -1 --restart-after 1000 -n WORKER,UI \"node dist/cron/worker.js\" \"node dist/cron/fileServer.js start --port 8675\"",
     "install_deps": "npm install --no-save --no-audit --no-fund",
